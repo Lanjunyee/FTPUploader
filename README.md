@@ -1,61 +1,87 @@
-# FTP 文件传输（FTPUploader）
+<p align="center">
+  <img src="FTPUploader/Assets.xcassets/AppIcon.appiconset/icon_128x128@2x.png" width="96" height="96" alt="FTPUploader 应用图标：蓝色文件夹与上传箭头">
+</p>
 
-原生 macOS FTP 客户端，支持匿名或账户登录、保存常用站点、浏览远程目录和单文件上传。
+<h1 align="center">FTP 文件传输</h1>
 
-## 下载与安装
+<p align="center"><strong>连接服务器，找到目录，上传文件。</strong></p>
+<p align="center">一款轻量的 macOS FTP 客户端，让日常文件上传更直观。</p>
 
-在 [Releases](https://github.com/Lanjunyee/FTPUploader/releases) 下载 `FTPUploader-0.1.0-macOS-universal.zip`，解压后将 `FTPUploader.app` 放入“应用程序”文件夹。
+<p align="center">
+  <a href="https://github.com/Lanjunyee/FTPUploader/releases/latest">下载安装</a> ·
+  <a href="#能做什么">功能介绍</a> ·
+  <a href="#开始使用">开始使用</a>
+</p>
 
-- 系统 API 基线为 macOS 13；当前发布构建包含 Apple Silicon（arm64）和 Intel（x86_64）。最低系统版本及 Intel 真机尚未实测。
-- 此版本使用本地 ad-hoc 签名，未使用 Developer ID 签名、未经过 Apple 公证。下载后的首次启动可能被 macOS 安全机制拦截。签名完整性检查通过不代表系统信任或公证通过。
-- 使用普通 FTP，网络传输不加密。钥匙串仅保护本机保存的密码。
+<p align="center"><sub>原生 macOS 界面 · Apple Silicon 与 Intel 通用安装包 · 浅色与深色外观</sub></p>
 
-## 使用
+---
 
-1. 输入 FTP 主机或地址，例如 `ftp://example.com:21/uploads`，选择匿名或账户登录，点击“连接”。
-2. 双击文件夹进入，使用“上一级”或“刷新”浏览目录。
-3. 点击“选择文件…”，再点击“上传到当前目录”；看到服务器最终确认后的“上传成功”才表示完成。
-4. 通过站点菜单或“设置…”管理常用站点。账户密码可选择保存到系统钥匙串。
+<p align="center">
+  <img src="docs/readme/upload-success.png" width="820" alt="FTP 文件传输的浅色界面：远程目录、已选文件、上传目标和服务器确认后的上传成功状态">
+  <br>
+  <sub>目录浏览与文件上传集中在一个窗口。截图使用本机测试服务器。</sub>
+</p>
 
-选择或保存站点不会自动连接。上传期间目标固定，不能更换服务器、身份或目录。同名文件是否可覆盖取决于服务器；失败后可能留下部分文件，应用不会自动删除、续传或重试。
+## 能做什么
 
-支持 MLSD 和常见 Unix/DOS LIST，目录名称优先 UTF-8，无法严格解码时尝试 GB18030。非 UTF-8 服务器可从目录列表逐层进入；地址栏中的中文初始目录需要使用服务器编码对应的百分号序列。下载、文件夹及批量上传、队列、同步、续传、远程编辑和 SFTP/FTPS 尚未实现。
+- **连接 FTP** — 支持匿名或账户密码登录。
+- **管理常用站点** — 保存服务器配置，按需将密码存入系统钥匙串。
+- **浏览远程目录** — 双击进入文件夹，按名称、类型或大小排序。
+- **上传单个文件** — 查看进度、目标路径和结果，服务器确认后才显示成功。
 
-## 构建与运行
+适合向已有 FTP 服务器提交作业、文档或其他文件。
 
-需要 Xcode 和 macOS SDK，无第三方包依赖，链接系统 libcurl。
+## 开始使用
+
+1. 从 [Releases](https://github.com/Lanjunyee/FTPUploader/releases/latest) 下载通用 ZIP 安装包，解压后将 `FTPUploader.app` 放入“应用程序”文件夹。
+2. 填写服务器地址，例如 `ftp://example.com:21/uploads`，选择登录方式，点击“连接”。
+3. 双击进入目标文件夹，点击“选择文件…” → “上传到当前目录”，等待“上传成功”。
+
+常用服务器可在站点菜单或“设置…”中保存，下次选择后点击“连接”即可。
+
+## 使用前了解
+
+- 当前仅支持**普通 FTP**，网络传输不加密；钥匙串仅保护本机保存的密码。
+- 每次上传一个文件，暂不支持下载、文件夹或批量上传、续传、SFTP / FTPS。
+- 同名文件可能被服务器覆盖；传输中断后可能留下部分文件，应用不会自动删除或重试。
+- 当前安装包采用本地签名，**未经过 Apple 公证**，首次打开可能被 macOS 拦截。
+- 系统 API 基线为 macOS 13；最低系统版本和 Intel 真机运行尚未实测。
+
+---
+
+## 开发
+
+SwiftUI / AppKit 构建原生界面，系统 libcurl 负责 FTP 传输，无第三方包依赖。
+
+<details>
+<summary>构建、测试与本机 FTP 夹具</summary>
+
+### 构建与运行
+
+需要 Xcode 及 macOS SDK。打开 `FTPUploader.xcodeproj`，选择 FTPUploader scheme，或运行：
 
 ```sh
 ./script/build_and_run.sh --verify
 ```
 
-或打开 `FTPUploader.xcodeproj`，选择 FTPUploader scheme。脚本生成 `dist/FTPUploader.app`，支持 `--debug`、`--logs` 与 `--telemetry`。
+产物位于 `dist/FTPUploader.app`。脚本还支持 `--debug`、`--logs` 与 `--telemetry`。
 
-构建通用 Release：
-
-```sh
-xcodebuild -project FTPUploader.xcodeproj -scheme FTPUploader \
-  -configuration Release -derivedDataPath .build/release \
-  ARCHS='arm64 x86_64' ONLY_ACTIVE_ARCH=NO build
-```
-
-## 测试
+### 自动化测试
 
 ```sh
 xcodebuild -project FTPUploader.xcodeproj -scheme FTPUploader \
   -destination 'platform=macOS,arch=arm64' -derivedDataPath .build/xcode test
 ```
 
-测试环境需要 macOS 14 或更新版本。测试通过 Python 标准库启动本机 FTP 夹具，覆盖目录编码、地址校验、站点及凭据、错误脱敏、上传内容与服务器最终响应等行为。
+测试环境需要 macOS 14 或更新版本。测试覆盖地址与目录编码、站点和凭据管理、错误脱敏及上传结果等行为。
 
-手动启动本机夹具：
+### 本机 FTP 夹具
 
 ```sh
 /usr/bin/python3 script/ftp_fixture.py --port 2121
 ```
 
-连接 `ftp://127.0.0.1:2121`；服务仅绑定本机地址，退出后清理临时数据。
+连接 `ftp://127.0.0.1:2121`。服务仅监听本机地址，使用临时数据，停止后自动清理。
 
-## 公开源码范围
-
-此仓库从 2026-10-06 的本地提交 `09f73f7` 导出当前源码快照。为保护内部验收资料中的个人及网络信息，未发布原 Git 历史、内部验收文档、截图和本机协作配置。应用代码、资源、测试与构建脚本保持原样。
+</details>
