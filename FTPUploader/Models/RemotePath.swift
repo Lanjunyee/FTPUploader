@@ -75,3 +75,50 @@ struct RemotePath: Equatable {
         }
     }
 }
+
+
+/// User text is encoded only after policy resolution; escaped octets are kept
+/// separate and are never decoded and then silently transcoded.
+struct FTPInitialPathSegment: Equatable {
+    enum Fragment: Equatable { case text(String), bytes(Data) }
+    let fragments: [Fragment]
+    let source: String
+
+    init(_ source: String) throws {
+        self.source = source
+        var fragments: [Fragment] = []
+        var literal = ""
+        var escaped = Data()
+        let chars = Array(source)
+        var index = 0
+        while index < chars.count {
+            if chars[index] == "%" {
+                if !literal.isEmpty { fragments.append(.text(literal)); literal = "" }
+                guard index + 2 < chars.count else { throw FTPError.invalidAddress("地址包含无效的百分号编码。") }
+                escaped.append(try RemotePath.percentDecode(String(chars[index...index + 2])))
+                index += 3
+            } else {
+                if !escaped.isEmpty { fragments.append(.bytes(escaped)); escaped = Data() }
+                literal.append(chars[index]); index += 1
+            }
+        }
+        if !literal.isEmpty { fragments.append(.text(literal)) }
+        if !escaped.isEmpty { fragments.append(.bytes(escaped)) }
+        self.fragments = fragments
+    }
+    var hasEscapedBytes: Bool { fragments.contains { if case .bytes = $0 { return true }; return false } }
+    var hasNonASCIIText: Bool {
+        fragments.contains { if case .text(let text) = $0 { return text.utf8.contains { $0 >= 128 } }; return false }
+    }
+    func encoded(using encoding: FTPTextEncoding) throws -> Data {
+        var data = Data()
+        for fragment in fragments {
+            switch fragment {
+            case .text(let text): data.append(try encoding.encode(text))
+            case .bytes(let bytes): data.append(bytes)
+            }
+        }
+        try RemotePath.validateName(data)
+        return data
+    }
+}

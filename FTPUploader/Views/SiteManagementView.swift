@@ -29,7 +29,7 @@ struct SiteManagementView: View {
                     ForEach(sites.sites) { site in
                         VStack(alignment: .leading, spacing: Metrics.spacing4) {
                             Text(site.name)
-                            Text("\(site.address) · \(site.loginMode.title)").font(.caption).foregroundStyle(.secondary)
+                            Text("\(site.transport.title) · \(site.address) · \(site.loginMode.title)").font(.caption).foregroundStyle(.secondary)
                         }.tag(site.id)
                     }
                 }.frame(minHeight: 180, maxHeight: 280)
@@ -45,7 +45,10 @@ struct SiteManagementView: View {
                 }
             }
             if let error = sites.error {
-                Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
+                Label { Text(error).foregroundStyle(.primary).textSelection(.enabled) } icon: {
+                    Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.red)
+                }
+                .font(.callout)
             }
             Divider()
             HStack {
@@ -54,7 +57,7 @@ struct SiteManagementView: View {
                     Spacer()
                     Button("保存") { save() }.disabled(!model.canEditConnection || !sites.canSave).keyboardShortcut(.defaultAction)
                 } else {
-                    Text("选择或保存站点不会自动连接。").font(.caption).foregroundStyle(.secondary)
+                    Text("选择或保存站点不会自动连接。").font(.callout).foregroundStyle(.secondary)
                     Spacer()
                 }
             }
@@ -126,6 +129,7 @@ private struct SiteEditor: View {
     let issueTicket: Int
     @FocusState private var focus: Field?
     @State private var identityChanged = false
+    @State private var originalTransport = FileTransport.ftp
     /// See ConnectionView: a direct nil/"" binding marks "explicit empty password"
     /// as soon as an untouched field is focused.
     @State private var passwordText = ""
@@ -135,11 +139,15 @@ private struct SiteEditor: View {
     var body: some View {
         Form {
             TextField("名称", text: $draft.name)
+            Picker("传输协议与安全模式", selection: $draft.transport) {
+                ForEach(FileTransport.allCases, id: \.self) { Text($0.title).tag($0) }
+            }
+            .accessibilityLabel("站点传输协议与安全模式")
             VStack(alignment: .leading, spacing: Metrics.spacing4) {
                 TextField("服务器", text: $draft.host)
                     .focused($focus, equals: .server)
                 Text("主机名或 IP，例如 example.com 或 127.0.0.1；端口和目录使用下方独立字段。")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.callout).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 fieldError(.server)
             }
@@ -153,18 +161,21 @@ private struct SiteEditor: View {
                     .focused($focus, equals: .initialDirectory)
                 fieldError(.initialDirectory)
             }
+            Picker("文件名编码", selection: $draft.encodingPolicy) {
+                ForEach(FTPEncodingPolicy.allCases, id: \.self) { Text($0.title).tag($0) }
+            }
+            .accessibilityLabel("站点文件名编码")
+            .disabled(draft.transport == .sftp)
             Picker("登录方式", selection: $draft.loginMode) {
-                ForEach(FTPLoginMode.allCases, id: \.self) { Text($0.title).tag($0) }
+                ForEach(draft.transport == .sftp ? [.account] : FTPLoginMode.allCases, id: \.self) { Text($0.title).tag($0) }
             }
             if draft.loginMode == .account {
                 VStack(alignment: .leading, spacing: Metrics.spacing4) {
-                    Text("用户名").font(.caption).foregroundStyle(.secondary)
                     TextField("用户名", text: $draft.username)
                         .focused($focus, equals: .username)
                     fieldError(.username)
                 }
                 VStack(alignment: .leading, spacing: Metrics.spacing4) {
-                    Text("密码").font(.caption).foregroundStyle(.secondary)
                     SecureField("密码", text: $passwordText)
                         .accessibilityLabel("站点密码")
                         .focused($focus, equals: .password)
@@ -177,7 +188,7 @@ private struct SiteEditor: View {
                         }
                     if identityChanged && draft.password == nil {
                         Text("连接信息已变更，请重新输入密码或明确选择使用空密码。")
-                            .font(.caption).foregroundStyle(.orange)
+                            .font(.callout).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     fieldError(.password)
@@ -187,20 +198,28 @@ private struct SiteEditor: View {
                     set: { on in draft.password = on ? "" : nil; passwordText = "" }
                 ))
                 Text("“使用空密码”表示显式发送空密码，而不是跳过认证。")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.callout).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 Toggle("记住密码", isOn: $draft.rememberPassword)
                 Text(draft.rememberPassword ? "保存后使用系统钥匙串。身份不变且不填写新密码时，保留原保存密码。" : "密码仅用于当前运行，重新打开时需输入。")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.callout).foregroundStyle(.secondary)
             }
         }
         .onChange(of: issueTicket) { _ in
             guard let issue else { return }
             focus = focusTarget(for: issue.field)
         }
-        .onAppear { passwordText = draft.password ?? "" }
+        .onAppear { passwordText = draft.password ?? ""; originalTransport = draft.transport }
         .onChange(of: draft.password) { value in
             if value != nil { identityChanged = false }
+        }
+        .onChange(of: draft.transport) { value in
+            invalidateIdentity()
+            // Preserve custom ports; replace only the previous protocol default.
+            let oldDefault = originalTransport.defaultPort
+            if draft.port == String(oldDefault) { draft.port = String(value.defaultPort) }
+            originalTransport = value
+            if value == .sftp { draft.loginMode = .account; draft.encodingPolicy = .utf8 }
         }
         .onChange(of: draft.host) { _ in invalidateIdentity() }
         .onChange(of: draft.port) { _ in invalidateIdentity() }
@@ -221,8 +240,10 @@ private struct SiteEditor: View {
     @ViewBuilder
     private func fieldError(_ field: FTPFormField) -> some View {
         if let issue, issue.field == field {
-            Text(issue.message)
-                .font(.caption).foregroundStyle(.red)
+            Label { Text(issue.message).foregroundStyle(.primary) } icon: {
+                Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.red)
+            }
+                .font(.callout)
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
         }

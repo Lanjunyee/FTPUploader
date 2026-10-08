@@ -35,3 +35,22 @@ enum FTPTextEncoding: Equatable {
         throw FTPError.incompatibleEncoding
     }
 }
+
+
+enum FTPEncodingPolicy: String, Codable, CaseIterable {
+    case automatic, utf8, gb18030
+    var title: String {
+        switch self {
+        case .automatic: return "自动"
+        case .utf8: return "UTF-8"
+        case .gb18030: return "GB18030"
+        }
+    }
+    var explicitEncoding: FTPTextEncoding? {
+        switch self {
+        case .automatic: return nil
+        case .utf8: return .utf8
+        case .gb18030: return .gb18030
+        }
+    }
+}

@@ -18,18 +18,24 @@ struct FieldIssue: Error, Equatable, LocalizedError {
 
 enum FTPError: Error, LocalizedError {
     case invalidAddress(String)
+    case security(String)
     case invalidName
     case incompatibleListing
     case incompatibleEncoding
     case localFile(String)
+    case uploadTargetConflict
+    case initialPath(String, String)
     case transport(code: Int32, response: Int, message: String, upload: Bool, mode: FTPLoginMode = .anonymous)
 
     var errorDescription: String? {
         switch self {
         case .invalidAddress(let message): return message
+        case .security(let message): return message
         case .invalidName: return "文件或目录名称包含无法安全访问的字符。"
         case .incompatibleListing: return "无法识别服务器的目录格式，当前目录尚未加载。"
         case .incompatibleEncoding: return "无法正确转换服务器的文件名编码，请核对服务器兼容性。"
+        case .initialPath(let segment, let reason): return "无法进入初始目录的“\(segment)”：\(reason)"
+        case .uploadTargetConflict: return "目标存在同名目录，不能上传此文件。"
         case .localFile(let message): return "无法读取所选文件：\(message)"
         case let .transport(code, response, message, upload, mode):
             let title: String

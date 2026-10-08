@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+typedef int (*FTPCancelCallback)(void *context);
+
 typedef int (*FTPDataCallback)(const unsigned char *bytes, size_t length, void *context);
 typedef void (*FTPProgressCallback)(int64_t sent, int64_t total, void *context);
 
@@ -11,6 +13,8 @@ typedef struct {
     long connect_timeout;
     long response_timeout;
     long stall_timeout;
+    int tls_mode; /* 0 FTP, 1 explicit TLS, 2 implicit TLS */
+    const char *ca_file;
 } FTPOptions;
 
 typedef struct {
@@ -22,10 +26,14 @@ typedef struct {
 } FTPResult;
 
 int ftp_available(void);
+int ftps_available(void);
 const char *ftp_result_message(const FTPResult *result);
 FTPResult ftp_list(const char *url, const char *method, const char *username, const char *password, FTPOptions options,
-                              FTPDataCallback callback, void *context);
+                              FTPDataCallback callback, FTPCancelCallback cancel, void *context);
 FTPResult ftp_upload(const char *url, const char *file_path, const char *username, const char *password, FTPOptions options,
-                                FTPProgressCallback callback, void *context);
+                                FTPProgressCallback callback, FTPCancelCallback cancel, void *context);
+
+FTPResult ftp_download(const char *url, const char *username, const char *password, FTPOptions options,
+                       FTPDataCallback data, FTPProgressCallback progress, FTPCancelCallback cancel, void *context);
 
 #endif

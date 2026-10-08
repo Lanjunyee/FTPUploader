@@ -7,6 +7,7 @@ protocol SiteStoring {
 
 final class SiteStore: SiteStoring {
     static let key = "ftp.savedSites"
+    static let legacyBackupKey = "ftp.savedSites.beforeSecureProtocols"
     private let defaults: UserDefaults
     private var loadSucceeded = false
 
@@ -33,7 +34,15 @@ final class SiteStore: SiteStoring {
             guard Set(sites.map(\.id)).count == sites.count else { throw SiteError.storage }
             try sites.forEach { try $0.validate() }
             let data = try JSONEncoder().encode(sites)
+            if defaults.object(forKey: Self.legacyBackupKey) == nil,
+               let source = defaults.data(forKey: Self.key),
+               let records = try JSONSerialization.jsonObject(with: source) as? [[String: Any]],
+               records.contains(where: { $0["transport"] == nil }) {
+                defaults.set(source, forKey: Self.legacyBackupKey)
+                guard defaults.data(forKey: Self.legacyBackupKey) == source else { throw SiteError.storage }
+            }
             defaults.set(data, forKey: Self.key)
+            guard defaults.data(forKey: Self.key) == data else { throw SiteError.storage }
         } catch { throw SiteError.storage }
     }
 }

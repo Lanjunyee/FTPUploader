@@ -3,7 +3,8 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 /// The bottom upload bar. Row count is decided by `UploadBarLayout`:
-/// file slot always, the target row once a file is chosen, and the status row only
+/// file slot always, the target row when it differs from a finished result,
+/// and the status row only
 /// while transferring, after finishing, or after a selection failure. The file slot
 /// and its two actions never move between states.
 ///
@@ -23,16 +24,26 @@ struct UploadView: View {
 
     private var isIdle: Bool { model.uploadState == .idle }
 
+    private var isFinished: Bool {
+        switch model.uploadState {
+        case .succeeded, .failed, .cancelled: return true
+        default: return false
+        }
+    }
+
     private var rows: UploadBarLayout.Rows {
         UploadBarLayout.rows(isConnected: model.hasDirectory,
                              hasSelectedFile: model.selectedFile != nil,
                              isIdle: isIdle,
-                             hasSelectionError: model.selectionError != nil)
+                             hasSelectionError: model.selectionError != nil,
+                             isFinished: isFinished,
+                             targetMatchesResult: model.pendingTarget == model.uploadTarget)
     }
 
     var body: some View {
         if rows.isVisible {
             bar
+                .modifier(FileDropTarget(model: model))
                 .fileImporter(isPresented: $showFilePicker,
                               allowedContentTypes: [.data],
                               allowsMultipleSelection: false) { result in
@@ -42,9 +53,25 @@ struct UploadView: View {
                     case .failure(let error): model.fileSelectionFailed(error)
                     }
                 }
+                .alert("覆盖同名文件？", isPresented: Binding(
+                    get: { model.overwriteRequestID != nil },
+                    set: { presented in
+                        if !presented, let id = model.overwriteRequestID { model.cancelOverwrite(id) }
+                    })) {
+                        if let id = model.overwriteRequestID {
+                            Button("取消", role: .cancel) { model.cancelOverwrite(id) }
+                                .keyboardShortcut(.defaultAction)
+                            Button("仅本次覆盖", role: .destructive) { model.confirmOverwrite(id) }
+                        }
+                    } message: {
+                        Text("目标：\(model.overwriteTarget ?? "")\n目标已有同名普通文件。仅授权本次上传；检查无法防止服务器并发变化，服务器仍可能拒绝写入。")
+                    }
                 .onChange(of: model.pendingTarget) { _ in detail = nil }
                 .onChange(of: model.selectedFile?.name) { _ in detail = nil }
-                .onChange(of: model.uploadState) { _ in detail = nil }
+                .onChange(of: model.uploadState) { state in
+                    detail = nil
+                    announce(state)
+                }
                 .onChange(of: model.selectionError) { _ in detail = nil }
                 .onChange(of: bus.request) { request in handle(request) }
         }
@@ -85,7 +112,7 @@ struct UploadView: View {
             if rows.showsStatus { statusRow }
         }
         .padding(Metrics.spacing12)
-        .background(.quaternary)
+        .background(.bar)
         .popover(item: $detail) { item in
             TextDetailsPopover(title: item.title, text: item.text) { detail = nil }
         }
@@ -141,7 +168,7 @@ struct UploadView: View {
             .help("查看完整目标（⌘⇧T）")
             .disabled(activeTarget == nil)
         }
-        .font(.caption)
+        .font(.callout)
     }
 
     private var activeTarget: String? {
@@ -165,35 +192,53 @@ struct UploadView: View {
                         error: error)
         } else {
             switch model.uploadState {
+            case .checkingTarget:
+                Label("正在检查上传目标…", systemImage: "magnifyingglass").font(.callout)
+            case .awaitingOverwrite:
+                Label("等待本次覆盖确认", systemImage: "questionmark.circle").font(.callout)
             case .idle:
                 Label("文件已就绪", systemImage: "arrow.up.circle")
                     .font(.caption).foregroundStyle(.secondary)
             case .uploading:
                 VStack(alignment: .leading, spacing: Metrics.spacing8) {
                     HStack(spacing: Metrics.spacing8) {
-                        Label("正在上传", systemImage: "arrow.up.circle.fill").foregroundStyle(Color.accentColor)
+                        Label { Text("正在上传").foregroundStyle(.primary) } icon: {
+                            Image(systemName: "arrow.up.circle.fill").foregroundStyle(Color.accentColor)
+                        }
                         Spacer(minLength: Metrics.spacing8)
                         Text("\(bytes(model.sent)) / \(bytes(model.total))")
                             .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                     }
                     .font(.callout)
                     ProgressView(value: Double(model.sent), total: Double(max(model.total, 1)))
+                        .accessibilityLabel("上传进度")
                 }
             case .awaitingCompletion:
                 HStack(spacing: Metrics.spacing8) {
-                    ProgressView().controlSize(.small)
+                    ProgressView().controlSize(.small).accessibilityLabel("上传进度：等待服务器确认")
                     Text("数据已发送，等待服务器确认…").font(.callout)
                     Spacer(minLength: Metrics.spacing8)
-                    Text("收到最终确认后才会显示上传成功。").font(.caption).foregroundStyle(.secondary)
+                    Text("收到最终确认后才会显示上传成功。").font(.callout).foregroundStyle(.secondary)
+                }
+            case .cancelling:
+                Label("正在取消…", systemImage: "stop.circle").font(.callout)
+            case .cancelled:
+                VStack(alignment: .leading, spacing: Metrics.spacing8) {
+                    Label("上传已取消", systemImage: "stop.circle").font(.callout)
+                    Text("远程可能存在部分或完整文件，请核对目标后再操作。")
+                        .font(.callout).foregroundStyle(.secondary)
+                    resultLine
                 }
             case .succeeded:
                 VStack(alignment: .leading, spacing: Metrics.spacing8) {
-                    Label("上传成功", systemImage: "checkmark.circle.fill")
-                        .font(.callout).foregroundStyle(.green)
+                    Label { Text("上传成功").foregroundStyle(.primary) } icon: {
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    }
+                    .font(.callout)
                     resultLine
                 }
             case .failed(let error):
-                failureLine(title: "未能确认上传成功",
+                failureLine(title: error.contains("同名目录") ? "目标存在同名目录，不能上传" : "未能确认上传成功",
                             detailText: "远程可能存在部分文件，请核对后再操作。",
                             popoverID: "uploadError",
                             popoverTitle: "错误详情",
@@ -209,7 +254,9 @@ struct UploadView: View {
                              error: String) -> some View {
         VStack(alignment: .leading, spacing: Metrics.spacing8) {
             HStack(spacing: Metrics.spacing8) {
-                Label(title, systemImage: "exclamationmark.circle.fill").foregroundStyle(.red)
+                Label { Text(title).foregroundStyle(.primary) } icon: {
+                    Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.red)
+                }
                 Spacer(minLength: Metrics.spacing8)
                 Button("查看错误详情") {
                     detail = DetailItem(id: popoverID, title: popoverTitle, text: error)
@@ -218,7 +265,7 @@ struct UploadView: View {
             }
             .font(.callout)
             if model.uploadState != .idle { resultLine }
-            Text(detailText).font(.caption).foregroundStyle(.secondary)
+            Text(detailText).font(.callout).foregroundStyle(.secondary)
         }
     }
 
@@ -237,10 +284,77 @@ struct UploadView: View {
             .help("查看目标（⌘⇧Y）")
             .disabled(model.uploadTarget == nil)
         }
-        .font(.caption)
+        .font(.callout)
+    }
+
+    private func announce(_ state: UploadState) {
+        let message: String
+        switch state {
+        case .checkingTarget: message = "正在检查上传目标"
+        case .awaitingOverwrite: message = "目标存在同名文件，等待本次覆盖确认"
+        case .uploading: message = "正在上传"
+        case .cancelling: message = "正在取消，等待底层操作停止"
+        case .cancelled: message = "上传已取消，远程可能存在部分或完整文件，请核对目标。"
+        case .succeeded: message = "上传成功"
+        case .failed: message = "未能确认上传成功，远程可能存在部分文件，请核对后再操作。"
+        case .idle, .awaitingCompletion: return
+        }
+        NSAccessibility.post(element: NSApp as Any,
+                             notification: .announcementRequested,
+                             userInfo: [.announcement: message,
+                                        .priority: NSAccessibilityPriorityLevel.high.rawValue])
     }
 
     private func bytes(_ count: Int64) -> String {
         ByteCountFormatter.string(fromByteCount: count, countStyle: .file)
+    }
+}
+
+/// Keep Finder's original URL so the existing selection code can use the
+/// sandbox access granted by the drag. Receiving a drop never starts an upload.
+@MainActor
+struct FileDropTarget: ViewModifier {
+    @ObservedObject var model: AppModel
+    @State private var isTargeted = false
+
+    func body(content: Content) -> some View {
+        content
+            .overlay {
+                if isTargeted && model.canChooseFile {
+                    Rectangle().strokeBorder(Color.accentColor, lineWidth: 2)
+                        .allowsHitTesting(false)
+                }
+            }
+            .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
+                guard model.canChooseFile else { return false }
+                guard providers.count == 1, let provider = providers.first else {
+                    model.selectDroppedFiles([])
+                    return false
+                }
+                Task {
+                    do {
+                        let url: URL = try await withCheckedThrowingContinuation { continuation in
+                            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, error in
+                                if let error {
+                                    continuation.resume(throwing: error)
+                                } else if let url = item as? URL {
+                                    continuation.resume(returning: url)
+                                } else if let data = item as? Data,
+                                          let url = URL(dataRepresentation: data, relativeTo: nil) {
+                                    continuation.resume(returning: url)
+                                } else {
+                                    continuation.resume(throwing: FTPError.localFile("无法读取拖入的文件。"))
+                                }
+                            }
+                        }
+                        model.selectDroppedFiles([url])
+                    } catch {
+                        // The app may have started another operation while the
+                        // provider was resolving. Do not change that operation.
+                        if model.canChooseFile { model.fileSelectionFailed(error) }
+                    }
+                }
+                return true
+            }
     }
 }

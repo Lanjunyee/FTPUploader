@@ -11,6 +11,10 @@ case "$MODE" in
   *) echo "usage: $0 [--verify|--debug|--logs|--telemetry]" >&2; exit 2 ;;
 esac
 
+if [[ ! -f "$PROJECT_ROOT/.build/secure-deps/universal/lib/libssh2.a" ]]; then
+  "$PROJECT_ROOT/script/build_secure_dependencies.sh"
+fi
+
 pkill -x "$APP_NAME" >/dev/null 2>&1 || true
 xcodebuild -quiet -project "$PROJECT_ROOT/FTPUploader.xcodeproj" \
   -scheme "$APP_NAME" -configuration Debug \

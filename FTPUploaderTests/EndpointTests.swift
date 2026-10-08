@@ -12,7 +12,7 @@ final class EndpointTests: XCTestCase {
     }
 
     func testInvalidInputsAreRejected() {
-        let inputs = ["", " ", "ftp://", "ftp://host:70000", "ftp://host:0", "ftp://host:-1", "ftp://host:abc", "sftp://host", "https://host", "ftp://user:secret@host", "ftp://@host", "ftp://host?x=1", "ftp://host/#destination", "ftp://bad host", "ftp://host/a%ZZ", "ftp://host/%2Fother", "ftp://host/%0ASTOR", "ftp://host/..", "host\n", "ftp://host\\other"]
+        let inputs = ["", " ", "ftp://", "ftp://host:70000", "ftp://host:0", "ftp://host:-1", "ftp://host:abc", "https://host", "ftp://user:secret@host", "ftp://@host", "ftp://host?x=1", "ftp://host/#destination", "ftp://bad host", "ftp://host/a%ZZ", "ftp://host/%2Fother", "ftp://host/%0ASTOR", "ftp://host/..", "host\n", "ftp://host\\other"]
         for input in inputs {
             XCTAssertThrowsError(try FTPEndpoint(address: input), "Accepted invalid input: \(input)")
         }
@@ -23,7 +23,6 @@ final class EndpointTests: XCTestCase {
             ("", "请输入"),
             ("ftp://host:70000", "端口"),
             ("ftp://host:0", "端口"),
-            ("sftp://host", "ftp://"),
             ("https://host", "ftp://"),
             ("ftp://user:secret@host", "账号密码"),
             ("ftp://@host", "账号密码"),
@@ -62,4 +61,22 @@ final class EndpointTests: XCTestCase {
         let path = try RemotePath.root.appending(name: "共享 资料", bytes: bytes)
         XCTAssertEqual(try RemotePath.percentDecode(String(path.encodedDirectory.dropFirst().dropLast())), bytes)
     }
+    func testSecureProtocolDefaultsCustomPortsAndConflicts() throws {
+        for transport in FileTransport.allCases {
+            let endpoint = try FTPEndpoint(address: "example.test/中文", transport: transport)
+            XCTAssertEqual(endpoint.transport, transport)
+            XCTAssertEqual(endpoint.port, transport.defaultPort)
+            let custom = try FTPEndpoint(address: "example.test:2022/中文", transport: transport)
+            XCTAssertEqual(custom.port, 2022)
+            XCTAssertEqual(custom.initialPath.display, "/中文")
+        }
+        XCTAssertEqual(try FTPEndpoint(address: "ftps://example.test").transport, .ftpsImplicit)
+        XCTAssertEqual(try FTPEndpoint(address: "sftp://example.test").port, 22)
+        XCTAssertThrowsError(try FTPEndpoint(address: "sftp://host", transport: .ftpsExplicit))
+        XCTAssertThrowsError(try FTPEndpoint(address: "ftp://host", transport: .sftp))
+        XCTAssertThrowsError(try FTPEndpoint(address: "ftps://host", transport: .ftpsExplicit))
+        XCTAssertThrowsError(try FTPEndpoint(address: "sftp://host/%B9%B2"))
+        XCTAssertThrowsError(try FTPEndpoint(address: "scp://host"))
+    }
+
 }

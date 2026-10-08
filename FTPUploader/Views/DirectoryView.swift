@@ -22,6 +22,7 @@ struct DirectoryView: View {
     @State private var selectedEntry: Data?
     @State private var sortOrder: [KeyPathComparator<DirectoryRow>] = []
     @State private var showFailure = false
+    @State private var nameEntry: Data?
 
     private var rows: [DirectoryRow] {
         // SwiftUI's Table reports header clicks through `sortOrder` but does not sort
@@ -52,20 +53,27 @@ struct DirectoryView: View {
             Divider()
             footer
         }
-        .onChange(of: model.currentLocation) { _ in selectedEntry = nil }
+        .onChange(of: model.currentLocation) { _ in
+            selectedEntry = nil
+            nameEntry = nil
+        }
         .onChange(of: model.entries) { entries in
             if !entries.contains(where: { $0.id == selectedEntry }) { selectedEntry = nil }
+            if !entries.contains(where: { $0.id == nameEntry }) { nameEntry = nil }
             syncOpenAvailability()
         }
         .onChange(of: selectedEntry) { _ in syncOpenAvailability() }
         .onChange(of: model.isBusy) { _ in syncOpenAvailability() }
         .onAppear { syncOpenAvailability() }
-        .onDisappear { bus.setOpenAvailability(false) }
+        .onDisappear { bus.setOpenAvailability(false); bus.canDownloadSelectedFile = false }
         .onChange(of: bus.request) { request in
             switch request {
             case .showDirectoryError:
                 showFailure = true
                 bus.clear(.showDirectoryError)
+            case .downloadSelectedFile:
+                if let row = selectedRow { chooseDownload(row.entry) }
+                bus.clear(.downloadSelectedFile)
             case .openSelectedFolder:
                 openSelectedFolder()
                 bus.clear(.openSelectedFolder)
@@ -73,6 +81,7 @@ struct DirectoryView: View {
                 break
             }
         }
+        .modifier(FileDropTarget(model: model))
     }
 
     /// The selected row, and the subset of it that the open command can act on.
@@ -84,6 +93,7 @@ struct DirectoryView: View {
 
     private func syncOpenAvailability() {
         bus.setOpenAvailability(selectedFolder != nil && !model.isBusy)
+        bus.canDownloadSelectedFile = selectedRow != nil && selectedFolder == nil && !model.isBusy
     }
 
     private func openSelectedFolder() {
@@ -91,12 +101,29 @@ struct DirectoryView: View {
         model.enter(folder.entry)
     }
 
+    private func chooseDownload(_ entry: RemoteEntry) {
+        guard !entry.isDirectory, !model.isBusy else { return }
+        let panel = NSSavePanel()
+        panel.title = "下载文件"; panel.prompt = "保存"; panel.nameFieldStringValue = entry.name
+        panel.canCreateDirectories = true
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            do {
+                let identity = try LocalDownload.identity(url)
+                model.download(entry, to: url, authorizedIdentity: identity)
+            } catch { model.downloadSelectionFailed(error) }
+        }
+    }
+
     private var table: some View {
         Table(rows, selection: $selectedEntry, sortOrder: $sortOrder) {
             TableColumn("名称", value: \.name) { row in
                 DirectoryEntryCell(entry: row.entry,
                                    isSelected: selectedEntry == row.id,
-                                   isBusy: model.isBusy) {
+                                   isBusy: model.isBusy,
+                                   showName: Binding(get: { nameEntry == row.id },
+                                                     set: { nameEntry = $0 ? row.id : nil })) {
+                    guard !model.isBusy else { return }
                     model.enter(row.entry)
                 }
             }
@@ -105,25 +132,45 @@ struct DirectoryView: View {
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())
-                    .onTapGesture(count: 2) { model.enter(row.entry) }
             }
             .width(min: 56, ideal: 64, max: 120)
             TableColumn("大小", value: \.sizeRank) { row in
                 Text(DirectoryEntryCell.sizeText(row.entry))
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
                     .contentShape(Rectangle())
-                    .onTapGesture(count: 2) { model.enter(row.entry) }
             }
             .width(min: 64, ideal: 88, max: 180)
+        }
+        .contextMenu(forSelectionType: Data.self) { ids in
+            if ids.count == 1, let id = ids.first, let row = rows.first(where: { $0.id == id }) {
+                if row.entry.isDirectory {
+                    Button("打开") { open(ids) }
+                        .disabled(model.isBusy)
+                }
+                if !row.entry.isDirectory {
+                    Button("下载…") { chooseDownload(row.entry) }.disabled(model.isBusy)
+                        .accessibilityLabel("下载文件 " + row.entry.name)
+                }
+                Button("查看完整名称") { nameEntry = id }
+            }
+        } primaryAction: { ids in
+            open(ids)
         }
         .frame(minHeight: 100)
     }
 
+    private func open(_ ids: Set<Data>) {
+        guard !model.isBusy, ids.count == 1, let id = ids.first,
+              let row = rows.first(where: { $0.id == id }), row.entry.isDirectory else { return }
+        model.enter(row.entry)
+    }
+
     private func failureNotice(_ error: String) -> some View {
         HStack(spacing: Metrics.spacing8) {
-            Label("目录读取失败，已保留原目录", systemImage: "exclamationmark.circle")
-                .foregroundStyle(.red)
+            Label { Text("目录读取失败，已保留原目录").foregroundStyle(.primary) } icon: {
+                Image(systemName: "exclamationmark.circle").foregroundStyle(.red)
+            }
             Spacer(minLength: Metrics.spacing8)
             Button("查看详情") { showFailure = true }
                 .help("查看目录错误详情（⌘⇧D）")
@@ -131,7 +178,7 @@ struct DirectoryView: View {
                     TextDetailsPopover(title: "目录错误", text: error) { showFailure = false }
                 }
         }
-        .font(.caption)
+        .font(.callout)
         .padding(.horizontal, Metrics.spacing12)
         .padding(.vertical, Metrics.spacing8)
         .onChange(of: error) { _ in showFailure = false }
@@ -141,6 +188,12 @@ struct DirectoryView: View {
         HStack {
             Text("\(model.entries.count) 个项目")
             Spacer()
+            HStack(spacing: Metrics.spacing4) {
+                Image(systemName: connectionStatusSymbol).foregroundStyle(connectionStatusTint)
+                Text(connectionStatusTitle).foregroundStyle(.primary).fixedSize()
+            }
+            .accessibilityElement(children: .combine)
+            Text("·")
             Text(model.connectionIdentity).lineLimit(1)
         }
         .font(.caption)
@@ -149,18 +202,36 @@ struct DirectoryView: View {
         .padding(.vertical, Metrics.spacing8)
     }
 
+    private var connectionStatusTitle: String {
+        if model.isDirectoryLoading { return "正在读取" }
+        if model.directoryError != nil { return "目录未更新" }
+        return "已连接"
+    }
+
+    private var connectionStatusSymbol: String {
+        if model.isDirectoryLoading { return "arrow.triangle.2.circlepath" }
+        if model.directoryError != nil { return "exclamationmark.circle.fill" }
+        return "checkmark.circle.fill"
+    }
+
+    private var connectionStatusTint: Color {
+        if model.isDirectoryLoading { return .secondary }
+        if model.directoryError != nil { return .orange }
+        return .green
+    }
+
     private var emptyState: some View {
         VStack(spacing: Metrics.spacing12) {
             if model.isDirectoryLoading {
                 ProgressView().controlSize(.small)
-                Text("正在读取目录…").font(.headline)
-                Text("读取完成后即可选择上传文件。").font(.caption).foregroundStyle(.secondary)
+                Text("远程目录").font(.headline)
+                Text("读取完成后即可选择上传文件。").font(.callout).foregroundStyle(.secondary)
             } else {
                 Image(systemName: "folder")
                     .font(.system(size: 32))
                     .foregroundStyle(Color.accentColor.opacity(0.7))
                 Text("这个文件夹是空的").font(.headline)
-                Text("选择一个文件，上传到当前目录。").font(.caption).foregroundStyle(.secondary)
+                Text("选择一个文件，上传到当前目录。").font(.callout).foregroundStyle(.secondary)
             }
         }
         .padding(Metrics.spacing16)
@@ -176,8 +247,8 @@ private struct DirectoryEntryCell: View {
     let entry: RemoteEntry
     let isSelected: Bool
     let isBusy: Bool
+    @Binding var showName: Bool
     let open: () -> Void
-    @State private var showName = false
     @State private var isHovering = false
 
     static func sizeText(_ entry: RemoteEntry) -> String {
@@ -194,15 +265,15 @@ private struct DirectoryEntryCell: View {
                     .buttonStyle(.borderless).foregroundStyle(.secondary)
                     .keyboardShortcut(isSelected ? KeyboardShortcut("i", modifiers: .command) : nil)
                     .help("查看完整名称（选中后 ⌘I）").accessibilityLabel("查看名称：\(entry.name)")
-                    .popover(isPresented: $showName, arrowEdge: .trailing) {
-                        TextDetailsPopover(title: entry.isDirectory ? "文件夹名称" : "文件名称", text: entry.name) {
-                            showName = false
-                        }
-                    }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .onHover { isHovering = $0 }
+        .popover(isPresented: $showName, arrowEdge: .trailing) {
+            TextDetailsPopover(title: entry.isDirectory ? "文件夹名称" : "文件名称", text: entry.name) {
+                showName = false
+            }
+        }
     }
 
     @ViewBuilder
@@ -211,13 +282,12 @@ private struct DirectoryEntryCell: View {
             name
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
-                .onTapGesture(count: 2) { open() }
                 // Combine so the folder is one accessibility element that exposes a
                 // semantic open action, not just a pointer gesture.
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel(entry.name)
                 .accessibilityAddTraits(.isButton)
-                .accessibilityAction { open() }
+                .accessibilityAction { if !isBusy { open() } }
         } else {
             name
                 .frame(maxWidth: .infinity, alignment: .leading)

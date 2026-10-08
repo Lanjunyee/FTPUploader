@@ -18,13 +18,18 @@ struct ConnectionView: View {
     private enum Field: Hashable { case address, username, password }
 
     var body: some View {
-        VStack(spacing: 0) {
-            Spacer(minLength: 0)
-            form
-            Spacer(minLength: 0)
+        GeometryReader { geometry in
+            ScrollView {
+                VStack(spacing: 0) {
+                    Spacer(minLength: 0)
+                    form
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity)
+                .frame(minHeight: max(0, geometry.size.height - Metrics.spacing24 * 2))
+                .padding(Metrics.spacing24)
+            }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(Metrics.spacing24)
         .onChange(of: bus.request) { request in
             guard request == .showDirectoryError else { return }
             showError = true
@@ -40,45 +45,52 @@ struct ConnectionView: View {
 
     private var form: some View {
         VStack(alignment: .leading, spacing: Metrics.spacing16) {
+            Picker("传输协议与安全模式", selection: $model.transport) {
+                ForEach(FileTransport.allCases, id: \.self) { Text($0.title).tag($0) }
+            }
+            .accessibilityLabel("传输协议与安全模式")
+            .disabled(!model.canEditConnection)
             VStack(alignment: .leading, spacing: Metrics.spacing8) {
-                Text("服务器地址").font(.caption).foregroundStyle(.secondary)
-                HStack(spacing: Metrics.spacing8) {
-                    Image(systemName: "network").foregroundStyle(.secondary)
-                    TextField("输入 FTP 服务器地址", text: $model.address)
-                        .textFieldStyle(.roundedBorder)
-                        .accessibilityLabel("FTP 服务器地址")
-                        .disabled(!model.canEditConnection)
-                        .focused($focus, equals: .address)
-                        .onSubmit { model.connect() }
-                }
-                Text("支持 ftp:// 地址或主机名，例如 ftp://example.com:21/uploads")
-                    .font(.caption).foregroundStyle(.secondary)
+                Text("服务器地址").font(.subheadline).foregroundStyle(.secondary)
+                TextField("输入服务器地址", text: $model.address)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("服务器地址")
+                    .disabled(!model.canEditConnection)
+                    .focused($focus, equals: .address)
+                Text("支持主机名及 ftp://、ftps://、sftp:// 地址；地址需与所选协议一致。")
+                    .font(.callout).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 fieldError(.address)
             }
 
             VStack(alignment: .leading, spacing: Metrics.spacing8) {
-                Text("登录方式").font(.caption).foregroundStyle(.secondary)
+                Text("登录方式").font(.subheadline).foregroundStyle(.secondary)
                 Picker("登录方式", selection: $model.loginMode) {
-                    ForEach(FTPLoginMode.allCases, id: \.self) { mode in Text(mode.title).tag(mode) }
+                    ForEach(model.transport == .sftp ? [.account] : FTPLoginMode.allCases, id: \.self) { mode in Text(mode.title).tag(mode) }
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .disabled(!model.canEditConnection)
             }
 
+            Picker("文件名编码", selection: $model.encodingPolicy) {
+                ForEach(FTPEncodingPolicy.allCases, id: \.self) { Text($0.title).tag($0) }
+            }
+            .accessibilityLabel("文件名编码")
+            .disabled(!model.canEditConnection || model.transport == .sftp)
+
             if model.loginMode == .account {
                 VStack(alignment: .leading, spacing: Metrics.spacing8) {
                     HStack(alignment: .top, spacing: Metrics.spacing12) {
                         VStack(alignment: .leading, spacing: Metrics.spacing4) {
-                            Text("用户名").font(.caption).foregroundStyle(.secondary)
+                            Text("用户名").font(.subheadline).foregroundStyle(.secondary)
                             TextField("用户名", text: $model.username)
                                 .accessibilityLabel("用户名")
                                 .focused($focus, equals: .username)
                             fieldError(.username)
                         }
                         VStack(alignment: .leading, spacing: Metrics.spacing4) {
-                            Text("密码").font(.caption).foregroundStyle(.secondary)
+                            Text("密码").font(.subheadline).foregroundStyle(.secondary)
                             SecureField("密码", text: $passwordText)
                                 .accessibilityLabel("密码")
                                 .focused($focus, equals: .password)
@@ -91,7 +103,7 @@ struct ConnectionView: View {
                                 }
                             if model.identityChangedNotice {
                                 Text("连接信息已变更，请重新输入密码或明确选择使用空密码。")
-                                    .font(.caption).foregroundStyle(.orange)
+                                    .font(.callout).foregroundStyle(.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
                             }
                             fieldError(.password)
@@ -107,7 +119,7 @@ struct ConnectionView: View {
                     }
                     .disabled(!model.canEditConnection)
                     Text("“使用空密码”表示显式发送空密码，而不是跳过认证。")
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(.callout).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -117,6 +129,7 @@ struct ConnectionView: View {
                 Spacer(minLength: Metrics.spacing8)
                 Button("连接") { model.connect() }
                     .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
                     .disabled(!model.canConnect)
             }
 
@@ -124,9 +137,8 @@ struct ConnectionView: View {
         }
         .padding(Metrics.spacing24)
         .frame(maxWidth: Metrics.formMaxWidth)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: Metrics.cornerRadius))
-        .overlay(RoundedRectangle(cornerRadius: Metrics.cornerRadius).strokeBorder(.quaternary, lineWidth: 1))
         .onAppear { passwordText = model.password ?? "" }
+        .onSubmit { model.connect() }
     }
 
     /// The reason for one field, placed under that field. Errors wrap instead of
@@ -134,8 +146,10 @@ struct ConnectionView: View {
     @ViewBuilder
     private func fieldError(_ field: FTPFormField) -> some View {
         if let issue = model.fieldIssue, issue.field == field {
-            Text(issue.message)
-                .font(.caption).foregroundStyle(.red)
+            Label { Text(issue.message).foregroundStyle(.primary) } icon: {
+                Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.red)
+            }
+                .font(.callout)
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
         }
@@ -157,27 +171,32 @@ struct ConnectionView: View {
                 ProgressView().controlSize(.small)
                 Text("正在读取目录…")
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
+            .font(.callout)
+            .foregroundStyle(.primary)
         } else {
             HStack(spacing: Metrics.spacing4) {
                 Image(systemName: model.directoryError == nil ? "circle" : "exclamationmark.circle.fill")
+                    .foregroundStyle(model.directoryError == nil ? Color.secondary : Color.orange)
                 Text(model.directoryError == nil ? "未连接" : "连接失败")
             }
-            .font(.caption)
-            .foregroundStyle(model.directoryError == nil ? Color.secondary : Color.orange)
+            .font(.callout)
+            .foregroundStyle(.primary)
         }
     }
 
     @ViewBuilder
     private var errors: some View {
         if let error = model.credentialError ?? model.sites.error {
-            Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+            Label { Text(error).foregroundStyle(.primary).textSelection(.enabled) } icon: {
+                Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.red)
+            }
+            .font(.callout)
         }
         if let error = model.directoryError {
             HStack(spacing: Metrics.spacing8) {
-                Label("连接失败", systemImage: "exclamationmark.circle")
-                    .foregroundStyle(.red)
+                Label { Text("无法读取服务器目录").foregroundStyle(.primary) } icon: {
+                    Image(systemName: "exclamationmark.circle").foregroundStyle(.red)
+                }
                 Spacer(minLength: Metrics.spacing8)
                 Button("查看详情") { showError = true }
                     .help("查看目录错误详情（⌘⇧D）")
@@ -185,7 +204,7 @@ struct ConnectionView: View {
                         TextDetailsPopover(title: "连接与目录错误", text: error) { showError = false }
                     }
             }
-            .font(.caption)
+            .font(.callout)
         }
     }
 }

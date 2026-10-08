@@ -2,9 +2,9 @@ import Foundation
 
 /// Which rows the bottom upload bar shows.
 ///
-/// Kept as a pure function so all four layouts are unit tested without a window:
+/// Kept as a pure function so the layouts are unit tested without a window:
 /// not connected 0, connected with no file 1, file chosen and idle 2,
-/// transferring or finished 3.
+/// transferring or finished with a different target 3, finished with the same target 2.
 enum UploadBarLayout {
     struct Rows: Equatable {
         var isVisible: Bool
@@ -18,20 +18,26 @@ enum UploadBarLayout {
     static func rows(isConnected: Bool,
                      hasSelectedFile: Bool,
                      isIdle: Bool,
-                     hasSelectionError: Bool) -> Rows {
+                     hasSelectionError: Bool,
+                     isFinished: Bool = false,
+                     targetMatchesResult: Bool = false) -> Rows {
         guard isConnected else { return Rows(isVisible: false, showsTarget: false, showsStatus: false) }
         return Rows(isVisible: true,
-                    showsTarget: hasSelectedFile,
+                    showsTarget: hasSelectedFile && !(isFinished && targetMatchesResult),
                     showsStatus: !isIdle || hasSelectionError)
     }
 
     static func rowCount(isConnected: Bool,
                          hasSelectedFile: Bool,
                          isIdle: Bool,
-                         hasSelectionError: Bool) -> Int {
+                         hasSelectionError: Bool,
+                         isFinished: Bool = false,
+                         targetMatchesResult: Bool = false) -> Int {
         rows(isConnected: isConnected,
              hasSelectedFile: hasSelectedFile,
              isIdle: isIdle,
-             hasSelectionError: hasSelectionError).count
+             hasSelectionError: hasSelectionError,
+             isFinished: isFinished,
+             targetMatchesResult: targetMatchesResult).count
     }
 }

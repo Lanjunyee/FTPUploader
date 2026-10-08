@@ -4,6 +4,8 @@ import Security
 final class MemoryKeychain: KeychainAccess {
     var items: [String: Data] = [:]
     var status = errSecSuccess
+    var writeStatus: OSStatus = errSecSuccess
+    var deleteStatus: OSStatus = errSecSuccess
     var deletes: [String] = []
     private func key(_ query: [String: Any]) -> String {
         "\(query[kSecAttrService as String]!)|\(query[kSecAttrAccount as String]!)"
@@ -14,17 +16,20 @@ final class MemoryKeychain: KeychainAccess {
         return (data == nil ? errSecItemNotFound : errSecSuccess, data)
     }
     func add(_ attributes: [String: Any]) -> OSStatus {
+        guard writeStatus == errSecSuccess else { return writeStatus }
         guard status == errSecSuccess else { return status }
         items[key(attributes)] = attributes[kSecValueData as String] as? Data
         return errSecSuccess
     }
     func update(_ query: [String: Any], attributes: [String: Any]) -> OSStatus {
+        guard writeStatus == errSecSuccess else { return writeStatus }
         guard status == errSecSuccess else { return status }
         guard items[key(query)] != nil else { return errSecItemNotFound }
         items[key(query)] = attributes[kSecValueData as String] as? Data
         return errSecSuccess
     }
     func delete(_ query: [String: Any]) -> OSStatus {
+        guard deleteStatus == errSecSuccess else { return deleteStatus }
         guard status == errSecSuccess else { return status }
         deletes.append(key(query))
         return items.removeValue(forKey: key(query)) == nil ? errSecItemNotFound : errSecSuccess
@@ -121,4 +126,31 @@ final class PasswordTests: XCTestCase {
         XCTAssertFalse(corrupt.canSave); XCTAssertNotNil(corrupt.error)
         XCTAssertEqual(defaults.data(forKey: SiteStore.key), Data("broken".utf8))
     }
+    func testLegacyCredentialMigrationAndProtocolIsolation() async throws {
+        let site = try draft().configuration()
+        let legacy: [String: Any] = ["identity": ["host": site.host, "port": site.port, "username": site.username,
+                                               "mode": "account"], "password": "legacy secret"]
+        let data = try JSONSerialization.data(withJSONObject: legacy)
+        let key = "test-only|" + site.id.uuidString
+        for failure in 0...2 {
+            let access = MemoryKeychain(); access.items[key] = data
+            let store = PasswordStore(service: "test-only", access: access)
+            var secure = SiteDraft(site: site); secure.transport = .ftpsExplicit
+            let unavailable = try await store.password(for: secure.configuration())
+            XCTAssertNil(unavailable)
+            XCTAssertEqual(access.items[key], data)
+            if failure == 1 { access.writeStatus = errSecAuthFailed }
+            if failure == 2 { access.deleteStatus = errSecAuthFailed }
+            if failure == 0 {
+                let password = try await store.password(for: site)
+                XCTAssertEqual(password, "legacy secret")
+                XCTAssertNil(access.items[key])
+                XCTAssertNotNil(access.items["test-only.v2|" + site.id.uuidString])
+            } else {
+                do { _ = try await store.password(for: site); XCTFail("Migration error suppressed") } catch {}
+                XCTAssertEqual(access.items[key], data, "Source lost during failed migration")
+            }
+        }
+    }
+
 }

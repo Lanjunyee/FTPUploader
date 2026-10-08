@@ -46,4 +46,31 @@ final class UploadBarLayoutTests: XCTestCase {
                                                 isIdle: true,
                                                 hasSelectionError: true), 2)
     }
+
+    func testFinishedWithMatchingTargetUsesTwoRows() {
+        let rows = UploadBarLayout.rows(isConnected: true, hasSelectedFile: true,
+                                        isIdle: false, hasSelectionError: false,
+                                        isFinished: true, targetMatchesResult: true)
+        XCTAssertEqual(rows.count, 2)
+        XCTAssertFalse(rows.showsTarget)
+        XCTAssertTrue(rows.showsStatus)
+    }
+
+    func testFinishedWithDifferentTargetUsesThreeRows() {
+        let rows = UploadBarLayout.rows(isConnected: true, hasSelectedFile: true,
+                                        isIdle: false, hasSelectionError: false,
+                                        isFinished: true, targetMatchesResult: false)
+        XCTAssertEqual(rows.count, 3)
+        XCTAssertTrue(rows.showsTarget)
+        XCTAssertTrue(rows.showsStatus)
+    }
+
+    func testTransferringWithMatchingTargetKeepsThreeRows() {
+        let rows = UploadBarLayout.rows(isConnected: true, hasSelectedFile: true,
+                                        isIdle: false, hasSelectionError: false,
+                                        isFinished: false, targetMatchesResult: true)
+        XCTAssertEqual(rows.count, 3)
+        XCTAssertTrue(rows.showsTarget)
+        XCTAssertTrue(rows.showsStatus)
+    }
 }

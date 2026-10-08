@@ -6,6 +6,8 @@ import SwiftUI
 @MainActor
 final class TransferCommandBus: ObservableObject {
     enum Request: String, Equatable {
+        case chooseBatch, showTransfers
+        case downloadSelectedFile
         case chooseFile
         case showPath, showSelectedFileName, showTarget, showResult
         case showDirectoryError, showUploadError
@@ -16,6 +18,8 @@ final class TransferCommandBus: ObservableObject {
     /// Mirrors whether the directory table currently has an openable folder
     /// selected, so the menu command cannot fire without a valid target.
     @Published private(set) var canOpenSelectedFolder = false
+
+    @Published var canDownloadSelectedFile = false
 
     func send(_ request: Request) { self.request = request }
 
@@ -67,13 +71,27 @@ struct TransferCommands: Commands {
             Button("打开所选文件夹") { bus.send(.openSelectedFolder) }
                 .keyboardShortcut(.return, modifiers: .command)
                 .disabled(!bus.canOpenSelectedFolder)
+            Button("下载所选文件…") { bus.send(.downloadSelectedFile) }
+                .keyboardShortcut("d", modifiers: .command)
+                .disabled(!bus.canDownloadSelectedFile)
             Divider()
             Button("选择文件…") { bus.send(.chooseFile) }
                 .keyboardShortcut("o", modifiers: .command)
                 .disabled(!model.canChooseFile)
+            Button("批量上传…") { bus.send(.chooseBatch) }
+                .keyboardShortcut("b", modifiers: [.command, .shift]).disabled(!model.canChooseFile)
+            Button("队列与记录…") { bus.send(.showTransfers) }
+                .keyboardShortcut("h", modifiers: [.command, .shift])
+            Button("取消全部队列任务") { model.batch.cancelAll() }.disabled(!model.batch.isLocked)
             Button("上传到当前目录") { model.upload() }
                 .keyboardShortcut("u", modifiers: [.command, .shift])
                 .disabled(!model.canUpload)
+            let cancellationID = model.cancellationID
+            Button("取消当前操作") {
+                if let cancellationID { model.cancelOperation(id: cancellationID) }
+            }
+                .keyboardShortcut(".", modifiers: .command)
+                .disabled(!model.canCancel)
             Divider()
             Button("查看完整路径") { bus.send(.showPath) }
                 .keyboardShortcut("p", modifiers: [.command, .shift])

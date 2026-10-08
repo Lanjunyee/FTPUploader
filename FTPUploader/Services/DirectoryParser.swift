@@ -2,12 +2,7 @@ import Foundation
 
 enum DirectoryParser {
     static func parse(_ data: Data, machineReadable: Bool, preferredEncoding: FTPTextEncoding? = nil) throws -> DirectoryListing {
-        let encoding: FTPTextEncoding
-        if data.allSatisfy({ $0 < 128 }), let preferred = preferredEncoding {
-            encoding = preferred
-        } else {
-            encoding = try FTPTextEncoding.detect(data)
-        }
+        let encoding = try preferredEncoding ?? FTPTextEncoding.detect(data)
         let text = try encoding.decode(data)
         var entries: [RemoteEntry] = []
         var names = Set<Data>()
