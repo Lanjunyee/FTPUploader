@@ -162,4 +162,91 @@ final class AuthenticationTests: XCTestCase {
         XCTAssertEqual(try fixture.commands().filter { $0["command"] == "AUTH" }.count, 1)
     }
 
+    func testPrivateKeyFormatMatrixAndTransfers() async throws {
+        let fixture = try SFTPFixture(keyAuth: true); defer { fixture.stop() }
+        let hosts = fixture.root.appendingPathComponent(".trusted.json")
+        let store = HostTrustStore(url: hosts); try store.trust(fixture.identity)
+        let client = FTPClient(responseTimeout: 4, stallTimeout: 4, trust: store)
+        for format in ["openssh-ed25519", "openssh-rsa", "pem-rsa", "pkcs8-rsa"] {
+            for encrypted in [false, true] {
+                let url = fixture.root.appendingPathComponent(".keys/" + format + (encrypted ? "-encrypted" : ""))
+                let material = try PrivateKeyAccess().read(url)
+                let credentials = try FTPCredentials.key(username: "member", material: material,
+                                                        passphrase: encrypted ? " 密钥口令:@ " : nil)
+                let listing = try await client.list(endpoint: fixture.endpoint, path: .root, credentials: credentials)
+                XCTAssertFalse(listing.entries.isEmpty, format)
+                let local = fixture.root.appendingPathComponent(".inputs/source.bin")
+                try FileManager.default.createDirectory(at: local.deletingLastPathComponent(), withIntermediateDirectories: true)
+                for bytes in [Data([0, 255, 10]), Data()] {
+                    try bytes.write(to: local)
+                    try await client.upload(endpoint: fixture.endpoint, path: .root, file: local, encoding: .utf8, credentials: credentials) { _, _ in }
+                    // Address the uploaded file by its exact raw name.
+                    let remote = try RemotePath.root.appending(name: local.lastPathComponent, bytes: Data(local.lastPathComponent.utf8))
+                    var received = Data()
+                    try await client.download(endpoint: fixture.endpoint, path: remote, credentials: credentials,
+                                              cancellation: FTPCancellationToken(), receive: { received.append($0) }, progress: { _, _ in })
+                    XCTAssertEqual(received, bytes, format)
+                }
+            }
+        }
+        XCTAssertFalse(try fixture.commands().contains { $0["command"] == "AUTH" })
+    }
+
+    func testPrivateKeyTrustAndFailuresNeverFallback() async throws {
+        let fixture = try SFTPFixture(keyAuth: true); defer { fixture.stop() }
+        let store = HostTrustStore(url: fixture.root.appendingPathComponent(".trusted.json"))
+        let client = FTPClient(responseTimeout: 3, trust: store)
+        let material = try PrivateKeyAccess().read(fixture.root.appendingPathComponent(".keys/openssh-ed25519-encrypted"))
+        let credentials = try FTPCredentials.key(username: "member", material: material, passphrase: "wrong")
+        do { _ = try await client.list(endpoint: fixture.endpoint, path: .root, credentials: credentials); XCTFail("Unknown host authenticated") }
+        catch HostTrustError.unknown {}
+        XCTAssertFalse(try fixture.commands().contains { $0["command"] == "AUTH_KEY" })
+        try store.trust(SSHHostIdentity(host: fixture.identity.host, port: fixture.identity.port, key: fixture.identity.key + Data([1])))
+        do { _ = try await client.list(endpoint: fixture.endpoint, path: .root, credentials: credentials); XCTFail("Changed host authenticated") }
+        catch HostTrustError.changed {}
+        XCTAssertFalse(try fixture.commands().contains { $0["command"] == "AUTH_KEY" })
+        try store.reset(host: fixture.identity.host, port: fixture.identity.port)
+        try store.trust(fixture.identity)
+        do { _ = try await client.list(endpoint: fixture.endpoint, path: .root, credentials: credentials); XCTFail("Wrong phrase authenticated") }
+        catch { XCTAssertFalse(error.localizedDescription.contains("wrong")) }
+        XCTAssertFalse(try fixture.commands().contains { ["AUTH", "LIST", "OPEN"].contains($0["command"] ?? "") })
+        let plain = try PrivateKeyAccess().read(fixture.root.appendingPathComponent(".keys/openssh-rsa"))
+        let rejected = try FTPCredentials.key(username: "unapproved", material: plain, passphrase: nil)
+        do { _ = try await client.list(endpoint: fixture.endpoint, path: .root, credentials: rejected); XCTFail("Unapproved user authenticated") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("公钥")) }
+        XCTAssertFalse(try fixture.commands().contains { $0["command"] == "AUTH" })
+    }
+
+    func testPrivateKeyAuthenticationTimeoutCancellationAndUnsupportedPEM() async throws {
+        for cancel in [false, true] {
+            let fixture = try SFTPFixture(scenario: "slow-auth", delay: 3, keyAuth: true)
+            defer { fixture.stop() }
+            let store = HostTrustStore(url: fixture.root.appendingPathComponent(".trusted.json"))
+            try store.trust(fixture.identity)
+            let credentials = try FTPCredentials.key(username: "member", material: PrivateKeyAccess().read(fixture.root.appendingPathComponent(".keys/openssh-ed25519")), passphrase: nil)
+            let token = FTPCancellationToken()
+            let task = Task { try await FTPClient(responseTimeout: 1, trust: store).list(endpoint: fixture.endpoint, path: .root, credentials: credentials, cancellation: token) }
+            if cancel {
+                let limit = Date().addingTimeInterval(2)
+                while !(try fixture.commands().contains { $0["command"] == "AUTH_KEY" }) && Date() < limit { try await Task.sleep(nanoseconds: 5_000_000) }
+                token.cancel()
+            }
+            let started = Date()
+            do { _ = try await task.value; XCTFail("Stalled authentication succeeded") }
+            catch { if cancel { XCTAssertTrue(error is CancellationError) } else { XCTAssertTrue(error.localizedDescription.contains("超时")) } }
+            XCTAssertLessThan(Date().timeIntervalSince(started), 2)
+            XCTAssertFalse(try fixture.commands().contains { ["AUTH", "LIST", "OPEN"].contains($0["command"] ?? "") })
+        }
+        let fixture = try SFTPFixture(keyAuth: true); defer { fixture.stop() }
+        let store = HostTrustStore(url: fixture.root.appendingPathComponent(".trusted.json")); try store.trust(fixture.identity)
+        let damaged = try FTPCredentials.key(username: "member", material: PrivateKeyMaterial(Data("-----BEGIN PRIVATE KEY-----\nnot-a-key".utf8)), passphrase: nil)
+        do { _ = try await FTPClient(trust: store).list(endpoint: fixture.endpoint, path: .root, credentials: damaged); XCTFail("Damaged PEM accepted") }
+        catch { XCTAssertTrue(error is FieldIssue); XCTAssertFalse(error.localizedDescription.contains("not-a-key")) }
+        XCTAssertThrowsError(try PrivateKeyAccess().read(fixture.root.appendingPathComponent(".keys/unsupported-openssh-ec")))
+        let unsupported = try FTPCredentials.key(username: "member", material: PrivateKeyAccess().read(fixture.root.appendingPathComponent(".keys/unsupported-pem-ec")), passphrase: nil)
+        do { _ = try await FTPClient(trust: store).list(endpoint: fixture.endpoint, path: .root, credentials: unsupported); XCTFail("Unsupported EC key accepted") }
+        catch { XCTAssertTrue(error is FieldIssue) }
+        XCTAssertFalse(try fixture.commands().contains { ["AUTH", "AUTH_KEY", "LIST", "OPEN"].contains($0["command"] ?? "") })
+    }
+
 }

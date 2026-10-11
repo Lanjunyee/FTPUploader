@@ -1,14 +1,33 @@
 import Foundation
 
-enum FTPLoginMode: String, Codable, CaseIterable {
+enum FTPLoginMode: String, Codable, CaseIterable, Sendable {
     case anonymous, account
     var title: String { self == .anonymous ? "匿名" : "账号密码" }
 }
 
-struct FTPCredentials: CustomStringConvertible, CustomDebugStringConvertible {
+enum AuthenticationMethod: String, Codable, CaseIterable, Sendable {
+    case password, privateKey
+    var title: String { self == .password ? "账户密码" : "私钥文件" }
+}
+
+struct FTPCredentials: CustomStringConvertible, CustomDebugStringConvertible, Sendable {
     let mode: FTPLoginMode
     let username: String
     let password: String
+    var privateKey: PrivateKeyMaterial? = nil
+    var passphrase: String? = nil
+    var authenticationMethod: AuthenticationMethod { privateKey == nil ? .password : .privateKey }
+
+    static func key(username: String, material: PrivateKeyMaterial, passphrase: String?) throws -> FTPCredentials {
+        _ = try account(username: username, password: "")
+        guard passphrase?.contains("\0") != true else { throw FieldIssue(field: .passphrase, message: "私钥口令不能包含空字符。") }
+        return FTPCredentials(mode: .account, username: username, password: "", privateKey: material, passphrase: passphrase)
+    }
+
+    func sameAuthentication(as other: FTPCredentials) -> Bool {
+        mode == other.mode && username == other.username && authenticationMethod == other.authenticationMethod
+            && password == other.password && privateKey?.digest == other.privateKey?.digest && passphrase == other.passphrase
+    }
 
     static let anonymous = FTPCredentials(mode: .anonymous, username: "anonymous", password: "anonymous@")
     var description: String { "FTPCredentials(\(mode.rawValue), [redacted])" }
@@ -27,7 +46,11 @@ struct FTPCredentials: CustomStringConvertible, CustomDebugStringConvertible {
     }
 
     func redacting(_ text: String) -> String {
-        password.isEmpty ? text : text.replacingOccurrences(of: password, with: "[redacted]")
+        var result = text
+        for secret in [password, passphrase ?? "", privateKey.flatMap { String(data: $0.bytes, encoding: .utf8) } ?? ""] where !secret.isEmpty {
+            result = result.replacingOccurrences(of: secret, with: "[redacted]")
+        }
+        return result
     }
 }
 
@@ -48,16 +71,18 @@ struct FTPIdentity: Codable, Equatable {
     let username: String
     let mode: FTPLoginMode
     var transport = FileTransport.ftp
+    var authenticationMethod = AuthenticationMethod.password
 
-    private enum CodingKeys: String, CodingKey { case host, port, username, mode, transport }
-    init(host: String, port: Int, username: String, mode: FTPLoginMode, transport: FileTransport = .ftp) {
-        self.host = host; self.port = port; self.username = username; self.mode = mode; self.transport = transport
+    private enum CodingKeys: String, CodingKey { case host, port, username, mode, transport, authenticationMethod }
+    init(host: String, port: Int, username: String, mode: FTPLoginMode, transport: FileTransport = .ftp, authenticationMethod: AuthenticationMethod = .password) {
+        self.host = host; self.port = port; self.username = username; self.mode = mode; self.transport = transport; self.authenticationMethod = authenticationMethod
     }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         self.init(host: try values.decode(String.self, forKey: .host), port: try values.decode(Int.self, forKey: .port),
                   username: try values.decode(String.self, forKey: .username), mode: try values.decode(FTPLoginMode.self, forKey: .mode),
-                  transport: try values.decodeIfPresent(FileTransport.self, forKey: .transport) ?? .ftp)
+                  transport: try values.decodeIfPresent(FileTransport.self, forKey: .transport) ?? .ftp,
+                  authenticationMethod: try values.decodeIfPresent(AuthenticationMethod.self, forKey: .authenticationMethod) ?? .password)
     }
 }
 
@@ -72,8 +97,10 @@ struct FTPSite: Codable, Equatable, Identifiable {
     let rememberPassword: Bool
     var encodingPolicy = FTPEncodingPolicy.automatic
     var transport = FileTransport.ftp
+    var authenticationMethod = AuthenticationMethod.password
+    var privateKeyReference: PrivateKeyReference? = nil
 
-    var identity: FTPIdentity { FTPIdentity(host: host.lowercased(), port: port, username: username, mode: loginMode, transport: transport) }
+    var identity: FTPIdentity { FTPIdentity(host: host.lowercased(), port: port, username: username, mode: loginMode, transport: transport, authenticationMethod: authenticationMethod) }
     var address: String {
         let authority = host.contains(":") ? "[\(host)]" : host
         return "\(transport.scheme)://\(authority):\(port)\(initialDirectory)"
@@ -83,13 +110,16 @@ struct FTPSite: Codable, Equatable, Identifiable {
         guard endpoint.host == host, endpoint.port == port, !name.isEmpty,
               loginMode == .account || (!rememberPassword && username.isEmpty) else { throw SiteError.storage }
         guard transport != .sftp || (loginMode == .account && encodingPolicy == .utf8) else { throw SiteError.invalid("SFTP 需要账户密码和 UTF-8 编码。") }
+        guard authenticationMethod != .privateKey || (transport == .sftp && loginMode == .account && !rememberPassword && privateKeyReference != nil) else {
+            throw FieldIssue(field: .privateKey, message: "私钥认证仅适用于 SFTP，请选择私钥文件。")
+        }
         if loginMode == .account { _ = try FTPCredentials.account(username: username, password: "") }
     }
 }
 
 extension FTPSite {
     private enum CodingKeys: String, CodingKey {
-        case id, name, host, port, initialDirectory, loginMode, username, rememberPassword, encodingPolicy, transport
+        case id, name, host, port, initialDirectory, loginMode, username, rememberPassword, encodingPolicy, transport, authenticationMethod, privateKeyReference
     }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -100,7 +130,9 @@ extension FTPSite {
                   username: try values.decode(String.self, forKey: .username),
                   rememberPassword: try values.decode(Bool.self, forKey: .rememberPassword),
                   encodingPolicy: try values.decodeIfPresent(FTPEncodingPolicy.self, forKey: .encodingPolicy) ?? .automatic,
-                  transport: try values.decodeIfPresent(FileTransport.self, forKey: .transport) ?? .ftp)
+                  transport: try values.decodeIfPresent(FileTransport.self, forKey: .transport) ?? .ftp,
+                  authenticationMethod: try values.decodeIfPresent(AuthenticationMethod.self, forKey: .authenticationMethod) ?? .password,
+                  privateKeyReference: try values.decodeIfPresent(PrivateKeyReference.self, forKey: .privateKeyReference))
     }
 }
 
@@ -117,6 +149,10 @@ struct SiteDraft {
     var rememberPassword = false
     var encodingPolicy = FTPEncodingPolicy.automatic
     var transport = FileTransport.ftp
+    var authenticationMethod = AuthenticationMethod.password
+    var privateKeyReference: PrivateKeyReference?
+    var privateKeySelection: PrivateKeySelection?
+    var passphrase: String?
     var password: String?
 
     init() {}
@@ -124,9 +160,10 @@ struct SiteDraft {
         id = site.id; name = site.name; host = site.host; port = String(site.port)
         initialDirectory = site.initialDirectory; loginMode = site.loginMode
         username = site.username; rememberPassword = site.rememberPassword; encodingPolicy = site.encodingPolicy; transport = site.transport
+        authenticationMethod = site.authenticationMethod; privateKeyReference = site.privateKeyReference
     }
 
-    func configuration() throws -> FTPSite {
+    func configuration(keyAccess: PrivateKeyAccessing = PrivateKeyAccess()) throws -> FTPSite {
         let server: FTPEndpoint
         do { server = try FTPEndpoint(address: host, transport: transport) }
         catch let issue as FieldIssue { throw FieldIssue(field: .server, message: issue.message) }
@@ -149,7 +186,8 @@ struct SiteDraft {
         let site = FTPSite(id: id, name: name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? server.host : name,
                            host: endpoint.host, port: portNumber, initialDirectory: directory.hasSuffix("/") ? directory : directory + "/",
                            loginMode: loginMode, username: loginMode == .account ? username : "",
-                           rememberPassword: loginMode == .account && rememberPassword, encodingPolicy: encodingPolicy, transport: transport)
+                           rememberPassword: loginMode == .account && authenticationMethod == .password && rememberPassword, encodingPolicy: encodingPolicy, transport: transport,
+                           authenticationMethod: authenticationMethod, privateKeyReference: authenticationMethod == .privateKey ? (try privateKeySelection?.reference(access: keyAccess) ?? privateKeyReference) : nil)
         try site.validate()
         return site
     }

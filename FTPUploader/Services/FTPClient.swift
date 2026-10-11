@@ -18,7 +18,11 @@ final class FTPCancellationToken: @unchecked Sendable {
     }
 }
 
+enum RemoteDirectoryResult: Equatable { case created, reused, verifiedAfterError }
+
 protocol FTPServing {
+    func createDirectory(endpoint: FTPEndpoint, path: RemotePath, encoding: FTPTextEncoding,
+                         credentials: FTPCredentials, cancellation: FTPCancellationToken) async throws
     func download(endpoint: FTPEndpoint, path: RemotePath, credentials: FTPCredentials, cancellation: FTPCancellationToken,
                   receive: @escaping (Data) throws -> Void, progress: @escaping (Int64, Int64) -> Void) async throws
     func trustHost(_ identity: SSHHostIdentity) throws
@@ -28,9 +32,57 @@ protocol FTPServing {
     func list(endpoint: FTPEndpoint, path: RemotePath, encoding: FTPTextEncoding?, credentials: FTPCredentials, cancellation: FTPCancellationToken) async throws -> DirectoryListing
     func upload(endpoint: FTPEndpoint, path: RemotePath, file: URL, encoding: FTPTextEncoding, credentials: FTPCredentials, cancellation: FTPCancellationToken,
                 progress: @escaping (Int64, Int64) -> Void) async throws
+    func upload(endpoint: FTPEndpoint, path: RemotePath, source: SelectedLocalFile.VerifiedSource,
+                encoding: FTPTextEncoding, credentials: FTPCredentials, cancellation: FTPCancellationToken,
+                progress: @escaping (Int64, Int64) -> Void) async throws
 }
 
 extension FTPServing {
+    /// Fail closed for backends that have not implemented descriptor-based uploads.
+    func upload(endpoint: FTPEndpoint, path: RemotePath, source: SelectedLocalFile.VerifiedSource,
+                encoding: FTPTextEncoding, credentials: FTPCredentials, cancellation: FTPCancellationToken,
+                progress: @escaping (Int64, Int64) -> Void) async throws {
+        throw FTPError.localFile("此后端不支持已验证来源句柄，未开始发送。")
+    }
+    /// Called only by confirmed directory-task execution, never by preview/scanning.
+    /// A failed MKD is not retried: only a read-only type verification can satisfy it.
+    func ensureDirectory(endpoint: FTPEndpoint, path: RemotePath, encoding: FTPTextEncoding,
+                         credentials: FTPCredentials, cancellation: FTPCancellationToken) async throws -> RemoteDirectoryResult {
+        guard let parent = path.parent, let name = path.components.last else { throw FTPError.invalidName }
+        for component in path.components { try RemotePath.validateName(component.bytes) }
+        func check() async throws -> RemoteEntry? {
+            let listing = try await list(endpoint: endpoint, path: parent, encoding: encoding,
+                                         credentials: credentials, cancellation: cancellation)
+            try cancellation.checkCancellation()
+            return listing.entries.first { $0.rawName == name.bytes }
+        }
+        if let existing = try await check() {
+            guard existing.kind == .directory else { throw FTPError.uploadTargetConflict }
+            return .reused
+        }
+        try cancellation.checkCancellation()
+        do {
+            try await createDirectory(endpoint: endpoint, path: path, encoding: encoding,
+                                      credentials: credentials, cancellation: cancellation)
+            try cancellation.checkCancellation()
+            return .created
+        } catch {
+            let creationError = error
+            try cancellation.checkCancellation()
+            if creationError is CancellationError { throw CancellationError() }
+            // Do not change identity, delete, rename, chmod, or implicitly retry creation.
+            if let existing = try await check() {
+                guard existing.kind == .directory else { throw FTPError.uploadTargetConflict }
+                return .verifiedAfterError
+            }
+            throw creationError
+        }
+    }
+
+    func createDirectory(endpoint: FTPEndpoint, path: RemotePath, encoding: FTPTextEncoding,
+                         credentials: FTPCredentials, cancellation: FTPCancellationToken) async throws {
+        throw FTPError.localFile("此后端不支持目录创建。")
+    }
     func download(endpoint: FTPEndpoint, path: RemotePath, credentials: FTPCredentials, cancellation: FTPCancellationToken,
                   receive: @escaping (Data) throws -> Void, progress: @escaping (Int64, Int64) -> Void) async throws {
         throw FTPError.localFile("此后端不支持下载。")
@@ -166,6 +218,7 @@ final class FTPClient: FTPServing, @unchecked Sendable {
         if endpoint.transport == .sftp {
             return try await sftp.list(endpoint: endpoint, path: path, encoding: encoding, credentials: credentials, cancellation: cancellation)
         }
+        guard credentials.authenticationMethod == .password else { throw FTPError.security("私钥认证仅适用于 SFTP。") }
         return try await withCheckedThrowingContinuation { continuation in
             queue.async { [self] in
                 do {
@@ -217,23 +270,77 @@ final class FTPClient: FTPServing, @unchecked Sendable {
         return context.data
     }
 
-    func upload(endpoint: FTPEndpoint, path: RemotePath, file: URL, encoding: FTPTextEncoding, credentials: FTPCredentials = .anonymous, cancellation: FTPCancellationToken,
-                progress: @escaping (Int64, Int64) -> Void) async throws {
-        if endpoint.transport == .sftp {
-            return try await sftp.upload(endpoint: endpoint, path: path, file: file, encoding: encoding, credentials: credentials,
-                                         cancellation: cancellation, progress: progress)
+    func createDirectory(endpoint: FTPEndpoint, path: RemotePath, encoding: FTPTextEncoding,
+                         credentials: FTPCredentials, cancellation: FTPCancellationToken) async throws {
+        guard let parent = path.parent, let name = path.components.last else { throw FTPError.invalidName }
+        for component in path.components {
+            try RemotePath.validateName(component.bytes)
         }
+        guard try encoding.decode(name.bytes) == name.name else { throw FTPError.incompatibleEncoding }
+        if endpoint.transport == .sftp {
+            return try await sftp.createDirectory(endpoint: endpoint, path: path, encoding: encoding,
+                                                   credentials: credentials, cancellation: cancellation)
+        }
+        guard credentials.authenticationMethod == .password else { throw FTPError.security("私钥认证仅适用于 SFTP。") }
         try cancellation.checkCancellation()
         try checkCapability(endpoint)
-        let url = try endpoint.fileURL(path, name: file.lastPathComponent, encoding: encoding)
+        let url = endpoint.directoryURL(parent)
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            queue.async { [self] in
+                let context = TransferContext(cancellation: cancellation)
+                let pointer = Unmanaged.passUnretained(context).toOpaque()
+                do {
+                    try cancellation.checkCancellation()
+                    let result = withOptions(endpoint) { options in
+                        name.bytes.withUnsafeBytes { bytes in
+                            credentials.username.withCString { user in credentials.password.withCString { password in
+                                ftp_mkdir(url, bytes.bindMemory(to: UInt8.self).baseAddress, bytes.count, user, password, options, { pointer in
+                                    guard let pointer else { return 1 }
+                                    return Unmanaged<TransferContext>.fromOpaque(pointer).takeUnretainedValue().cancellation.isCancelled ? 1 : 0
+                                }, pointer)
+                            } }
+                        }
+                    }
+                    try cancellation.checkCancellation()
+                    try validate(result, endpoint: endpoint, upload: true, credentials: credentials)
+                    continuation.resume()
+                } catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+
+    func upload(endpoint: FTPEndpoint, path: RemotePath, file: URL, encoding: FTPTextEncoding, credentials: FTPCredentials = .anonymous, cancellation: FTPCancellationToken,
+                progress: @escaping (Int64, Int64) -> Void) async throws {
+        let selected = try SelectedLocalFile(url: file)
+        defer { selected.endAccess() }
+        let expected = try await selected.snapshot(cancellation: cancellation)
+        let source = try await selected.verifiedSource(matching: expected, cancellation: cancellation)
+        try await upload(endpoint: endpoint, path: path, source: source, encoding: encoding,
+                         credentials: credentials, cancellation: cancellation, progress: progress)
+    }
+
+    func upload(endpoint: FTPEndpoint, path: RemotePath, source: SelectedLocalFile.VerifiedSource,
+                encoding: FTPTextEncoding, credentials: FTPCredentials, cancellation: FTPCancellationToken,
+                progress: @escaping (Int64, Int64) -> Void) async throws {
+        if endpoint.transport == .sftp {
+            return try await sftp.upload(endpoint: endpoint, path: path, source: source, encoding: encoding, credentials: credentials,
+                                         cancellation: cancellation, progress: progress)
+        }
+        guard credentials.authenticationMethod == .password else { throw FTPError.security("私钥认证仅适用于 SFTP。") }
+        try cancellation.checkCancellation()
+        try checkCapability(endpoint)
+        let url = try endpoint.fileURL(path, name: source.url.lastPathComponent, encoding: encoding)
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             queue.async { [self] in
                 let context = TransferContext(cancellation: cancellation, progress: progress)
                 let pointer = Unmanaged.passUnretained(context).toOpaque()
+                do {
+                try cancellation.checkCancellation()
+                try source.validateDescriptor()
                 let result = withOptions(endpoint) { options in
                     credentials.username.withCString { user in
                     credentials.password.withCString { password in
-                        ftp_upload(url, file.path, user, password, options, { sent, total, pointer in
+                        ftp_upload_fd(url, source.descriptor, user, password, options, { sent, total, pointer in
                             guard let pointer else { return }
                             let context = Unmanaged<TransferContext>.fromOpaque(pointer).takeUnretainedValue()
                             if !context.cancellation.isCancelled { context.progress?(sent, total) }
@@ -244,7 +351,6 @@ final class FTPClient: FTPServing, @unchecked Sendable {
                     }
                 }
                 }
-                do {
                     try cancellation.checkCancellation()
                     try validate(result, endpoint: endpoint, upload: true, credentials: credentials)
                     continuation.resume()
@@ -259,6 +365,7 @@ final class FTPClient: FTPServing, @unchecked Sendable {
             return try await sftp.download(endpoint: endpoint, path: path, credentials: credentials, cancellation: cancellation,
                                            receive: receive, progress: progress)
         }
+        guard credentials.authenticationMethod == .password else { throw FTPError.security("私钥认证仅适用于 SFTP。") }
         try cancellation.checkCancellation()
         try checkCapability(endpoint)
         guard !path.components.isEmpty else { throw FTPError.invalidName }

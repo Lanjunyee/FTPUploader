@@ -4,7 +4,7 @@ import Foundation
 /// the reason next to the owning control and to focus the first invalid field,
 /// instead of guessing the field from the error text.
 enum FTPFormField: Hashable {
-    case address, username, password, server, port, initialDirectory
+    case address, username, password, server, port, initialDirectory, privateKey, passphrase
 }
 
 /// A local input failure tied to one field. `errorDescription` is the existing

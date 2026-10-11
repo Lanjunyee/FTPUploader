@@ -83,7 +83,8 @@ final class PasswordStore: PasswordStoring {
     }
 
     func password(for site: FTPSite) async throws -> String? {
-        try await perform { [self] in
+        guard site.authenticationMethod == .password else { return nil }
+        return try await perform { [self] in
             if let current = try read(site, legacy: false) { return current }
             // Legacy identities had no protocol. Never read them for an encrypted
             // protocol, even when host, port and username happen to match.
@@ -97,7 +98,7 @@ final class PasswordStore: PasswordStoring {
 
     func save(_ password: String, for site: FTPSite) async throws {
         _ = try FTPCredentials.account(username: site.username, password: password)
-        guard site.loginMode == .account && site.rememberPassword else { throw SiteError.invalid("此站点未开启记住密码。") }
+        guard site.loginMode == .account && site.authenticationMethod == .password && site.rememberPassword else { throw SiteError.invalid("此站点未开启记住密码。") }
         try await perform { [self] in
             try write(password, site: site)
             try removeLegacy(site.id)

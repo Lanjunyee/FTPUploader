@@ -153,4 +153,34 @@ final class PasswordTests: XCTestCase {
         }
     }
 
+    func testSwitchToPrivateKeyCleansOnlyItsPasswordAndPreservesSource() async throws {
+        let source = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let sourceBytes = Data("private source remains unchanged".utf8)
+        try sourceBytes.write(to: source)
+        defer { try? FileManager.default.removeItem(at: source) }
+        let suite = "key-tests-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite)); defer { defaults.removePersistentDomain(forName: suite) }
+        let access = MemoryKeychain(); let passwords = PasswordStore(service: "key-test", access: access)
+        let manager = SiteManager(store: SiteStore(defaults: defaults), passwords: passwords)
+        var d = draft(); d.transport = .sftp; d.port = "22"; d.encodingPolicy = .utf8
+        let saved = await manager.save(d); let original = try XCTUnwrap(saved)
+        var other = d; other.id = UUID()
+        let savedOther = await manager.save(other); let second = try XCTUnwrap(savedOther)
+        d.authenticationMethod = .privateKey
+        d.privateKeyReference = PrivateKeyReference(bookmark: Data(source.path.utf8), name: source.lastPathComponent, digest: Data([2]))
+        access.deleteStatus = errSecAuthFailed
+        let failed = await manager.save(d); XCTAssertNil(failed)
+        XCTAssertEqual(manager.sites[0], original)
+        access.deleteStatus = errSecSuccess
+        let switched = await manager.save(d); let key = try XCTUnwrap(switched)
+        // Even a denied keychain must not be read for key authentication.
+        access.status = errSecAuthFailed
+        let noPassword = try await passwords.password(for: key); XCTAssertNil(noPassword)
+        access.status = errSecSuccess
+        let otherPassword = try await passwords.password(for: second); XCTAssertEqual(otherPassword, "secret")
+        let deleted = await manager.delete(key); XCTAssertTrue(deleted)
+        XCTAssertEqual(manager.sites, [second])
+        XCTAssertEqual(try Data(contentsOf: source), sourceBytes)
+    }
+
 }

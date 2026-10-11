@@ -82,7 +82,8 @@ final class SiteTests: XCTestCase {
         XCTAssertEqual(try FTPEndpoint(address: one.address).initialPath.display, "/共享 资料%#")
         let bytes = try XCTUnwrap(defaults.data(forKey: SiteStore.key))
         XCTAssertFalse(String(decoding: bytes, as: UTF8.self).contains("do-not-persist-me"))
-        XCTAssertFalse(String(decoding: bytes, as: UTF8.self).contains("\"password\""))
+        let records = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [[String: Any]])
+        XCTAssertTrue(records.allSatisfy { $0["password"] == nil && $0["passphrase"] == nil })
     }
 
     func testLegacySitesDefaultToAutomaticAndEncodingEditPreservesConfiguration() throws {
@@ -205,6 +206,73 @@ final class SiteTests: XCTestCase {
         XCTAssertThrowsError(try store.verify(host))
         XCTAssertThrowsError(try store.trust(host))
         XCTAssertEqual(try Data(contentsOf: url), Data("damaged".utf8))
+    }
+
+    func testKeyConfigurationAndLegacyIdentityDecoding() throws {
+        var d = SiteDraft(); d.host = "example.test"; d.transport = .sftp
+        d.loginMode = .account; d.username = "member"; d.port = "22"; d.encodingPolicy = .utf8
+        let password = try d.configuration()
+        var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(password)) as? [String: Any])
+        legacy.removeValue(forKey: "authenticationMethod")
+        XCTAssertEqual(try JSONDecoder().decode(FTPSite.self, from: JSONSerialization.data(withJSONObject: legacy)).authenticationMethod, .password)
+        d.authenticationMethod = .privateKey
+        XCTAssertThrowsError(try d.configuration())
+        d.privateKeyReference = PrivateKeyReference(bookmark: Data([1]), name: "id_key", digest: Data([2]))
+        d.passphrase = "do-not-save"; d.rememberPassword = true
+        let keySite = try d.configuration()
+        XCTAssertFalse(keySite.rememberPassword)
+        let encoded = try JSONEncoder().encode(keySite)
+        XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains("do-not-save"))
+        XCTAssertEqual(try JSONDecoder().decode(FTPSite.self, from: encoded), keySite)
+        d.transport = .ftp; d.port = "21"
+        XCTAssertThrowsError(try d.configuration())
+        let material = PrivateKeyMaterial(Data("secret-key".utf8))
+        let credentials = try FTPCredentials.key(username: "member", material: material, passphrase: "phrase")
+        XCTAssertFalse(String(reflecting: credentials).contains("phrase"))
+        XCTAssertFalse(String(reflecting: material).contains("secret-key"))
+        XCTAssertEqual(credentials.redacting("secret-key phrase"), "[redacted] [redacted]")
+        XCTAssertThrowsError(try FTPCredentials.key(username: "member", material: material, passphrase: "nul\0"))
+    }
+
+    func testKeyAccessBoundsChangesAndAuthorizationPairing() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("key")
+        let bytes = Data("-----BEGIN RSA PRIVATE KEY-----\nfixture-one".utf8)
+        try bytes.write(to: url)
+        var starts = 0; var stops = 0
+        let access = PrivateKeyAccess(start: { _ in starts += 1; return true }, stop: { _ in stops += 1 },
+                                      create: { _ in Data([1]) }, restore: { _ in (url, false) })
+        let selection = try PrivateKeySelection.select(url, access: access)
+        let reference = try selection.reference(access: access)
+        XCTAssertEqual(try access.resolve(reference.bookmark), url)
+        XCTAssertEqual(starts, stops)
+        try Data("-----BEGIN RSA PRIVATE KEY-----\nfixture-two".utf8).write(to: url)
+        XCTAssertThrowsError(try selection.material(access: access))
+        XCTAssertEqual(starts, stops)
+        let stale = PrivateKeyAccess(restore: { _ in (url, true) })
+        XCTAssertThrowsError(try stale.resolve(Data([1])))
+        XCTAssertThrowsError(try PrivateKeyAccess().resolve(Data([0])))
+        let failure = PrivateKeyAccess(start: { _ in true }, stop: { _ in stops += 1 }, create: { _ in throw SiteError.storage })
+        XCTAssertThrowsError(try failure.bookmark(url))
+        for data in [Data(), Data("ssh-rsa public-only".utf8), Data(repeating: 65, count: PrivateKeyAccess.limit + 1)] {
+            try data.write(to: url)
+            XCTAssertThrowsError(try access.read(url))
+        }
+        XCTAssertThrowsError(try access.read(root))
+        try bytes.write(to: url)
+        let denied = PrivateKeyAccess(readBytes: { _, _ in throw POSIXError(.EACCES) })
+        do { _ = try denied.read(url); XCTFail("Permission failure accepted") }
+        catch { XCTAssertFalse(error.localizedDescription.contains("fixture-one")) }
+        let changedDuringRead = PrivateKeyAccess(readBytes: { handle, bound in
+            let result = try handle.read(upToCount: bound) ?? Data()
+            try Data("replacement".utf8).write(to: url)
+            return result
+        })
+        XCTAssertThrowsError(try changedDuringRead.read(url))
+        try FileManager.default.removeItem(at: url)
+        XCTAssertThrowsError(try access.read(url))
     }
 
 }

@@ -2,6 +2,7 @@ import Foundation
 
 enum DirectoryParser {
     static func parse(_ data: Data, machineReadable: Bool, preferredEncoding: FTPTextEncoding? = nil) throws -> DirectoryListing {
+        guard data.count <= TransferPlan.maximumListingBytes else { throw FTPError.incompatibleListing }
         let encoding = try preferredEncoding ?? FTPTextEncoding.detect(data)
         let text = try encoding.decode(data)
         var entries: [RemoteEntry] = []
@@ -33,16 +34,36 @@ enum DirectoryParser {
         }
         let type = facts["type"]?.lowercased()
         if type == "cdir" || type == "pdir" { return nil }
-        guard type == "dir" || type == "file" else { throw FTPError.incompatibleListing }
-        return try makeEntry(name, directory: type == "dir", size: facts["size"].flatMap(Int64.init), encoding: encoding)
+        let kind: RemoteEntry.Kind
+        switch type {
+        case "dir": kind = .directory
+        case "file": kind = .regularFile
+        case "os.unix=slink", "os.unix=symlink": kind = .symbolicLink
+        case let value? where value.hasPrefix("os.unix=slink:"): kind = .symbolicLink
+        case "os.unix=chr", "os.unix=blk", "os.unix=fifo", "os.unix=socket": kind = .other
+        default: kind = .unknown
+        }
+        return try makeEntry(name, kind: kind, size: facts["size"].flatMap(Int64.init), encoding: encoding)
     }
 
     private static func legacy(_ line: String, encoding: FTPTextEncoding) throws -> RemoteEntry? {
-        if let groups = captures(line, pattern: "^([d-])[rwxstST-]{9}[+@.]?\\s+\\d+\\s+\\S+\\s+\\S+\\s+(\\d+)\\s+\\S+\\s+\\d{1,2}\\s+(?:\\d{1,2}:\\d{2}|\\d{4})\\s(.+)$") {
-            return try makeEntry(groups[2], directory: groups[0] == "d", size: Int64(groups[1]), encoding: encoding)
+        if let groups = captures(line, pattern: "^([dlbcps-])[rwxstST-]{9}[+@.]?\\s+\\d+\\s+\\S+\\s+\\S+\\s+(\\d+(?:,\\s*\\d+)?)\\s+\\S+\\s+\\d{1,2}\\s+(?:\\d{1,2}:\\d{2}|\\d{4})\\s(.+)$") {
+            let kind: RemoteEntry.Kind
+            switch groups[0] {
+            case "d": kind = .directory
+            case "-": kind = .regularFile
+            case "l": kind = .symbolicLink
+            default: kind = .other
+            }
+            var name = groups[2]
+            if kind == .symbolicLink {
+                guard let separator = name.range(of: " -> ", options: .backwards) else { throw FTPError.incompatibleListing }
+                name = String(name[..<separator.lowerBound])
+            }
+            return try makeEntry(name, kind: kind, size: Int64(groups[1]), encoding: encoding)
         }
         if let groups = captures(line, pattern: "^\\d{2}-\\d{2}-\\d{2,4}\\s+\\d{1,2}:\\d{2}(?:AM|PM)\\s+(<DIR>|\\d+)\\s+(.+)$", options: .caseInsensitive) {
-            return try makeEntry(groups[1], directory: groups[0].uppercased() == "<DIR>", size: Int64(groups[0]), encoding: encoding)
+            return try makeEntry(groups[1], kind: groups[0].uppercased() == "<DIR>" ? .directory : .regularFile, size: Int64(groups[0]), encoding: encoding)
         }
         throw FTPError.incompatibleListing
     }
@@ -55,11 +76,11 @@ enum DirectoryParser {
         }
     }
 
-    private static func makeEntry(_ name: String, directory: Bool, size: Int64?, encoding: FTPTextEncoding) throws -> RemoteEntry? {
+    private static func makeEntry(_ name: String, kind: RemoteEntry.Kind, size: Int64?, encoding: FTPTextEncoding) throws -> RemoteEntry? {
         if name == "." || name == ".." { return nil }
         let bytes = try encoding.encode(name)
         try RemotePath.validateName(bytes)
         guard size == nil || size! >= 0 else { throw FTPError.incompatibleListing }
-        return RemoteEntry(name: name, rawName: bytes, isDirectory: directory, size: directory ? nil : size)
+        return RemoteEntry(name: name, rawName: bytes, kind: kind, size: size)
     }
 }

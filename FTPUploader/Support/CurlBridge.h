@@ -25,6 +25,8 @@ typedef struct {
     char message[768];
 } FTPResult;
 
+FTPResult ftp_mkdir(const char *parent_url, const unsigned char *name, size_t length, const char *username, const char *password,
+                    FTPOptions options, FTPCancelCallback cancel, void *context);
 int ftp_available(void);
 int ftps_available(void);
 const char *ftp_result_message(const FTPResult *result);
@@ -32,6 +34,10 @@ FTPResult ftp_list(const char *url, const char *method, const char *username, co
                               FTPDataCallback callback, FTPCancelCallback cancel, void *context);
 FTPResult ftp_upload(const char *url, const char *file_path, const char *username, const char *password, FTPOptions options,
                                 FTPProgressCallback callback, FTPCancelCallback cancel, void *context);
+
+/* Borrows a validated fd; duplicates/owns only its stream, never reopens a path. */
+FTPResult ftp_upload_fd(const char *url, int file_fd, const char *username, const char *password, FTPOptions options,
+                        FTPProgressCallback callback, FTPCancelCallback cancel, void *context);
 
 FTPResult ftp_download(const char *url, const char *username, const char *password, FTPOptions options,
                        FTPDataCallback data, FTPProgressCallback progress, FTPCancelCallback cancel, void *context);

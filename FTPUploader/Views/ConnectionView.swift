@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// The unconnected state: the whole content area is the connection form.
@@ -15,7 +16,7 @@ struct ConnectionView: View {
     @FocusState private var focus: Field?
 
     /// The fields this form can focus; other field issues (site editor) leave focus alone.
-    private enum Field: Hashable { case address, username, password }
+    private enum Field: Hashable { case address, username, password, privateKey, passphrase }
 
     var body: some View {
         GeometryReader { geometry in
@@ -63,14 +64,14 @@ struct ConnectionView: View {
                 fieldError(.address)
             }
 
-            VStack(alignment: .leading, spacing: Metrics.spacing8) {
-                Text("登录方式").font(.subheadline).foregroundStyle(.secondary)
+            if model.transport == .sftp {
+                Picker("认证方式", selection: $model.authenticationMethod) {
+                    ForEach(AuthenticationMethod.allCases, id: \.self) { Text($0.title).tag($0) }
+                }.pickerStyle(.segmented).disabled(!model.canEditConnection)
+            } else {
                 Picker("登录方式", selection: $model.loginMode) {
-                    ForEach(model.transport == .sftp ? [.account] : FTPLoginMode.allCases, id: \.self) { mode in Text(mode.title).tag(mode) }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .disabled(!model.canEditConnection)
+                    ForEach(FTPLoginMode.allCases, id: \.self) { Text($0.title).tag($0) }
+                }.pickerStyle(.segmented).disabled(!model.canEditConnection)
             }
 
             Picker("文件名编码", selection: $model.encodingPolicy) {
@@ -79,7 +80,7 @@ struct ConnectionView: View {
             .accessibilityLabel("文件名编码")
             .disabled(!model.canEditConnection || model.transport == .sftp)
 
-            if model.loginMode == .account {
+            if model.loginMode == .account && model.authenticationMethod == .password {
                 VStack(alignment: .leading, spacing: Metrics.spacing8) {
                     HStack(alignment: .top, spacing: Metrics.spacing12) {
                         VStack(alignment: .leading, spacing: Metrics.spacing4) {
@@ -124,6 +125,30 @@ struct ConnectionView: View {
                 }
             }
 
+            if model.transport == .sftp && model.authenticationMethod == .privateKey {
+                VStack(alignment: .leading, spacing: Metrics.spacing8) {
+                    Text("用户名").font(.subheadline).foregroundStyle(.secondary)
+                    TextField("用户名", text: $model.username).accessibilityLabel("用户名").focused($focus, equals: .username)
+                    fieldError(.username)
+                    Text("私钥文件").font(.subheadline).foregroundStyle(.secondary)
+                    HStack {
+                        Text(model.privateKeyName).lineLimit(1)
+                        Spacer()
+                        Button("选择私钥…") { chooseKey() }.focusable().focused($focus, equals: .privateKey)
+                    }
+                    if let location = model.privateKeyLocation {
+                        Text(location).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    }
+                    fieldError(.privateKey)
+                    Text("私钥口令").font(.subheadline).foregroundStyle(.secondary)
+                    SecureField("私钥口令", text: Binding(get: { model.passphrase ?? "" }, set: { model.passphrase = $0 }))
+                        .accessibilityLabel("私钥口令").focused($focus, equals: .passphrase)
+                    fieldError(.passphrase)
+                    Text(model.privateKeyIdentityNotice ? "连接信息或私钥已变更，请重新输入私钥口令。" : "口令用于解锁私钥，仅保留在当前连接会话；未加密私钥可留空。")
+                        .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }.disabled(!model.canEditConnection)
+            }
+
             HStack(spacing: Metrics.spacing12) {
                 status
                 Spacer(minLength: Metrics.spacing8)
@@ -139,6 +164,15 @@ struct ConnectionView: View {
         .frame(maxWidth: Metrics.formMaxWidth)
         .onAppear { passwordText = model.password ?? "" }
         .onSubmit { model.connect() }
+    }
+
+    private func chooseKey() {
+        guard model.canEditConnection else { return }
+        let panel = NSOpenPanel()
+        panel.title = "选择私钥文件"; panel.prompt = "选择私钥"
+        panel.canChooseFiles = true; panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false; panel.showsHiddenFiles = true
+        if panel.runModal() == .OK, let url = panel.url { model.choosePrivateKey(url) }
     }
 
     /// The reason for one field, placed under that field. Errors wrap instead of
@@ -160,6 +194,8 @@ struct ConnectionView: View {
         case .address: return .address
         case .username: return .username
         case .password: return .password
+        case .privateKey: return .privateKey
+        case .passphrase: return .passphrase
         default: return nil
         }
     }

@@ -63,10 +63,11 @@ final class SFTPFixture {
     let endpoint: FTPEndpoint
     var identity: SSHHostIdentity { SSHHostIdentity(host: endpoint.host, port: endpoint.port, key: Data(base64Encoded: info.key)!) }
     var root: URL { URL(fileURLWithPath: info.root) }
-    init(scenario: String = "normal", delay: Double = 2) throws {
+    init(scenario: String = "normal", delay: Double = 2, keyAuth: Bool = false) throws {
         let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         process.executableURL = project.appendingPathComponent(".build/ssh-fixture-env/bin/python")
         process.arguments = [project.appendingPathComponent("script/sftp_fixture.py").path,"--scenario",scenario,"--delay",String(delay)]
+        if keyAuth { process.arguments!.append("--key-auth") }
         let output = Pipe(); process.standardOutput = output
         let exited = self.exited
         process.terminationHandler = { _ in exited.signal() }

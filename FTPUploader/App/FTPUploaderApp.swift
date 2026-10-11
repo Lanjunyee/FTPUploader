@@ -1,38 +1,5 @@
 import SwiftUI
 
-/// Carries menu-command requests to the views that own the presentation state
-/// (popovers, the file importer). Keeps that state out of `AppModel`, which stays a
-/// transfer model only.
-@MainActor
-final class TransferCommandBus: ObservableObject {
-    enum Request: String, Equatable {
-        case chooseBatch, showTransfers
-        case downloadSelectedFile
-        case chooseFile
-        case showPath, showSelectedFileName, showTarget, showResult
-        case showDirectoryError, showUploadError
-        case openSelectedFolder
-    }
-
-    @Published var request: Request?
-    /// Mirrors whether the directory table currently has an openable folder
-    /// selected, so the menu command cannot fire without a valid target.
-    @Published private(set) var canOpenSelectedFolder = false
-
-    @Published var canDownloadSelectedFile = false
-
-    func send(_ request: Request) { self.request = request }
-
-    func setOpenAvailability(_ available: Bool) {
-        if canOpenSelectedFolder != available { canOpenSelectedFolder = available }
-    }
-
-    /// Called by the receiving view once it has handled the request.
-    func clear(_ handled: Request) {
-        if request == handled { request = nil }
-    }
-}
-
 @main
 struct FTPUploaderApp: App {
     @StateObject private var model = AppModel()
@@ -68,21 +35,29 @@ struct TransferCommands: Commands {
                 .keyboardShortcut("r", modifiers: .command)
                 .disabled(!canRefresh)
             Divider()
+            Button("展开／收起站点栏") { bus.send(.toggleSites) }
+            Button("筛选当前目录…") { bus.send(.showFilter) }
+                .keyboardShortcut("f", modifiers: .command).disabled(!model.hasDirectory)
+            Button("文件信息／完整名称") { bus.send(.showDirectoryInfo) }
+                .keyboardShortcut("i", modifiers: .command).disabled(!bus.canShowDirectoryInfo)
             Button("打开所选文件夹") { bus.send(.openSelectedFolder) }
                 .keyboardShortcut(.return, modifiers: .command)
                 .disabled(!bus.canOpenSelectedFolder)
-            Button("下载所选文件…") { bus.send(.downloadSelectedFile) }
+            Button(bus.downloadSelectionTitle) { bus.send(.downloadSelectedItems) }
                 .keyboardShortcut("d", modifiers: .command)
-                .disabled(!bus.canDownloadSelectedFile)
+                .disabled(!bus.canDownloadSelection)
             Divider()
             Button("选择文件…") { bus.send(.chooseFile) }
                 .keyboardShortcut("o", modifiers: .command)
                 .disabled(!model.canChooseFile)
-            Button("批量上传…") { bus.send(.chooseBatch) }
-                .keyboardShortcut("b", modifiers: [.command, .shift]).disabled(!model.canChooseFile)
+            Button("上传文件/文件夹…") { bus.send(.chooseBatch) }
+                .keyboardShortcut("b", modifiers: [.command, .shift]).disabled(!model.canPrepareCollection)
             Button("队列与记录…") { bus.send(.showTransfers) }
                 .keyboardShortcut("h", modifiers: [.command, .shift])
-            Button("取消全部队列任务") { model.batch.cancelAll() }.disabled(!model.batch.isLocked)
+            Button("取消全部队列任务") { model.cancelAllTransfers() }
+                .disabled(!model.canCancelAllTransfers)
+            Button("重试原批次失败项…") { _ = model.prepareCollectionRetry() }
+                .disabled(!model.canPrepareCollectionRetry())
             Button("上传到当前目录") { model.upload() }
                 .keyboardShortcut("u", modifiers: [.command, .shift])
                 .disabled(!model.canUpload)
