@@ -3,10 +3,12 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 static pthread_once_t initialization = PTHREAD_ONCE_INIT;
 static CURLcode initialization_result;
@@ -135,8 +137,8 @@ static int update_progress(void *pointer, curl_off_t download_total, curl_off_t 
     return 0;
 }
 
-static FTPResult perform(const char *url, const char *method, const char *file_path, const char *username, const char *password,
-                               FTPOptions options, Transfer *transfer) {
+static FTPResult perform(const char *url, const char *method, int file_fd, const char *username, const char *password,
+                               FTPOptions options, Transfer *transfer, const char *directory_command) {
     FTPResult result = {0};
     pthread_once(&initialization, initialize_curl);
     if (initialization_result != CURLE_OK) {
@@ -157,6 +159,7 @@ static FTPResult perform(const char *url, const char *method, const char *file_p
     }
     char error[CURL_ERROR_SIZE] = {0};
     struct curl_slist *commands = NULL;
+    struct curl_slist *directory_commands = NULL;
     CURLcode setup = CURLE_OK;
     CURLM *multi = NULL;
     int added = 0;
@@ -192,10 +195,19 @@ static FTPResult perform(const char *url, const char *method, const char *file_p
     commands = curl_slist_append(NULL, "*OPTS UTF8 ON");
     if (!commands) { setup = CURLE_OUT_OF_MEMORY; goto cleanup; }
     SET(CURLOPT_QUOTE, commands);
-    if (file_path) {
-        transfer->file = fopen(file_path, "rb");
+    if (directory_command) {
+        directory_commands = curl_slist_append(NULL, directory_command);
+        if (!directory_commands) { setup = CURLE_OUT_OF_MEMORY; goto cleanup; }
+        SET(CURLOPT_NOBODY, 1L);
+        SET(CURLOPT_POSTQUOTE, directory_commands);
+        SET(CURLOPT_FTP_CREATE_MISSING_DIRS, 0L);
+    } else if (file_fd >= 0) {
+        int owned_fd = fcntl(file_fd, F_DUPFD_CLOEXEC, 0);
+        transfer->file = owned_fd >= 0 ? fdopen(owned_fd, "rb") : NULL;
+        if (!transfer->file && owned_fd >= 0) close(owned_fd);
         struct stat status;
-        if (!transfer->file || fstat(fileno(transfer->file), &status) != 0 || !S_ISREG(status.st_mode)) {
+        if (!transfer->file || fstat(fileno(transfer->file), &status) != 0 || !S_ISREG(status.st_mode) ||
+            fseeko(transfer->file, 0, SEEK_SET) != 0) {
             setup = CURLE_READ_ERROR;
             snprintf(error, sizeof(error), "Local file is not a readable regular file");
             goto cleanup;
@@ -245,8 +257,8 @@ static FTPResult perform(const char *url, const char *method, const char *file_p
     result.bytes_sent = transfer->last_upload;
     if (transfer->timed_out) setup = CURLE_OPERATION_TIMEDOUT;
     if (transfer->read_failed) setup = CURLE_READ_ERROR;
-    if (setup == CURLE_OK && (result.response_code != 226 && result.response_code != 250)) setup = CURLE_FTP_WEIRD_SERVER_REPLY;
-    if (setup == CURLE_OK && file_path && result.bytes_sent != result.expected_size) setup = CURLE_PARTIAL_FILE;
+    if (setup == CURLE_OK && (directory_command ? result.response_code != 257 : (result.response_code != 226 && result.response_code != 250))) setup = CURLE_FTP_WEIRD_SERVER_REPLY;
+    if (setup == CURLE_OK && file_fd >= 0 && result.bytes_sent != result.expected_size) setup = CURLE_PARTIAL_FILE;
 
 cleanup:
     result.code = setup;
@@ -261,8 +273,24 @@ cleanup:
     if (multi) curl_multi_cleanup(multi);
     if (transfer->file) fclose(transfer->file);
     curl_slist_free_all(commands);
+    curl_slist_free_all(directory_commands);
     curl_easy_cleanup(curl);
 #undef SET
+    return result;
+}
+
+FTPResult ftp_mkdir(const char *parent_url, const unsigned char *name, size_t length, const char *username, const char *password,
+                    FTPOptions options, FTPCancelCallback cancel, void *context) {
+    FTPResult invalid = {.code = CURLE_URL_MALFORMAT};
+    if (!name || !length || length > 1024 * 1024 || (length == 1 && name[0] == '.') ||
+        (length == 2 && name[0] == '.' && name[1] == '.')) return invalid;
+    for (size_t i = 0; i < length; ++i) if (name[i] < 32 || name[i] == 127 || name[i] == '/') return invalid;
+    char *command = malloc(length + 5);
+    if (!command) { invalid.code = CURLE_OUT_OF_MEMORY; return invalid; }
+    memcpy(command, "MKD ", 4); memcpy(command + 4, name, length); command[length + 4] = 0;
+    Transfer transfer = {.cancel = cancel, .context = context};
+    FTPResult result = perform(parent_url, NULL, -1, username, password, options, &transfer, command);
+    free(command);
     return result;
 }
 
@@ -287,17 +315,27 @@ const char *ftp_result_message(const FTPResult *result) { return result->message
 FTPResult ftp_list(const char *url, const char *method, const char *username, const char *password, FTPOptions options,
                               FTPDataCallback callback, FTPCancelCallback cancel, void *context) {
     Transfer transfer = {.data = callback, .cancel = cancel, .context = context};
-    return perform(url, method, NULL, username, password, options, &transfer);
+    return perform(url, method, -1, username, password, options, &transfer, NULL);
 }
 
 FTPResult ftp_upload(const char *url, const char *file_path, const char *username, const char *password, FTPOptions options,
                                 FTPProgressCallback callback, FTPCancelCallback cancel, void *context) {
+    int fd = open(file_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) { FTPResult error = {.code = CURLE_READ_ERROR}; return error; }
+    FTPResult result = ftp_upload_fd(url, fd, username, password, options, callback, cancel, context);
+    close(fd);
+    return result;
+}
+
+FTPResult ftp_upload_fd(const char *url, int file_fd, const char *username, const char *password, FTPOptions options,
+                       FTPProgressCallback callback, FTPCancelCallback cancel, void *context) {
+    if (file_fd < 0) { FTPResult error = {.code = CURLE_READ_ERROR}; return error; }
     Transfer transfer = {.progress = callback, .cancel = cancel, .context = context};
-    return perform(url, NULL, file_path, username, password, options, &transfer);
+    return perform(url, NULL, file_fd, username, password, options, &transfer, NULL);
 }
 
 FTPResult ftp_download(const char *url, const char *username, const char *password, FTPOptions options,
                        FTPDataCallback data, FTPProgressCallback progress, FTPCancelCallback cancel, void *context) {
     Transfer transfer = {.data = data, .progress = progress, .cancel = cancel, .context = context, .downloading = 1};
-    return perform(url, NULL, NULL, username, password, options, &transfer);
+    return perform(url, NULL, -1, username, password, options, &transfer, NULL);
 }

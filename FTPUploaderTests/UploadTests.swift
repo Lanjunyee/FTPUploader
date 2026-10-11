@@ -431,6 +431,7 @@ final class BatchTransportMatrixTests: XCTestCase {
             let credentials = transport == .sftp ? try FTPCredentials.account(username: "member", password: "fixture-pass:@ ") : .anonymous
             try queue.prepare(urls, endpoint: endpoint, path: .root, encoding: .utf8, credentials: credentials)
             let initial = try ftp?.commands() ?? ssh!.commands(); XCTAssertTrue(initial.isEmpty)
+            try await wait { queue.state == .preview }
             queue.startOrContinue()
             try await wait { queue.overwriteID != nil }
             XCTAssertEqual(queue.items[0].state, .succeeded); XCTAssertEqual(queue.items[2].state, .waiting)
@@ -444,6 +445,58 @@ final class BatchTransportMatrixTests: XCTestCase {
             let commands = try ftp?.commands() ?? ssh!.commands()
             let writes = commands.filter { $0["command"] == (transport == .sftp ? "OPEN" : "STOR") }
             XCTAssertEqual(writes.count, 2)
+        }
+    }
+}
+
+final class VerifiedUploadTransportTests: XCTestCase {
+    func testAllProtocolsReadVerifiedDescriptorAfterPathReplacement() async throws {
+        for transport in FileTransport.allCases {
+            let ftp = transport == .sftp ? nil : try FTPFixture(transport: transport)
+            let ssh = transport == .sftp ? try SFTPFixture() : nil
+            defer { ftp?.stop(); ssh?.stop() }
+            let remoteRoot = ftp?.root ?? ssh!.root, endpoint = ftp?.endpoint ?? ssh!.endpoint
+            let trust = HostTrustStore(url: remoteRoot.appendingPathComponent(".trust.json"))
+            if let ssh { try trust.trust(ssh.identity) }
+            let ca = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+                .appendingPathComponent(".build/tls-fixtures/ca.pem").path
+            let client = FTPClient(caFile: ca, trust: trust)
+            let credentials = transport == .sftp ? try FTPCredentials.account(username: "member", password: "fixture-pass:@ ") : .anonymous
+            for replacement in ["link", "file", "ancestor"] {
+                for bytes in [Data([0, 255, 128, 10]), Data()] {
+                    let container = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                    let parent = container.appendingPathComponent("parent")
+                    try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+                    defer { try? FileManager.default.removeItem(at: container) }
+                    let url = parent.appendingPathComponent("资料 %#-\(replacement)-\(bytes.isEmpty ? "empty" : "binary").bin")
+                    try bytes.write(to: url)
+                    let selected = try SelectedLocalFile(url: url)
+                    defer { selected.endAccess() }
+                    let token = FTPCancellationToken(), expected = try await selected.snapshot(cancellation: token)
+                    let source = try await selected.verifiedSource(matching: expected, cancellation: token)
+                    if replacement == "ancestor" {
+                        try FileManager.default.moveItem(at: parent, to: container.appendingPathComponent("original"))
+                        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+                        try Data("foreign".utf8).write(to: url)
+                    } else {
+                        try FileManager.default.moveItem(at: url, to: parent.appendingPathComponent("original"))
+                        if replacement == "link" {
+                            let foreign = container.appendingPathComponent("foreign")
+                            try Data("foreign".utf8).write(to: foreign)
+                            try FileManager.default.createSymbolicLink(at: url, withDestinationURL: foreign)
+                        } else { try Data("foreign".utf8).write(to: url) }
+                    }
+                    try await client.upload(endpoint: endpoint, path: .root, source: source, encoding: .utf8,
+                                            credentials: credentials, cancellation: token, progress: { _, _ in })
+                    XCTAssertEqual(try Data(contentsOf: remoteRoot.appendingPathComponent(url.lastPathComponent)), bytes,
+                                   "\(transport) / \(replacement)")
+                    // Bridge closes only its duplicate; the borrowed source remains usable.
+                    XCTAssertNoThrow(try source.validateDescriptor())
+                    XCTAssertEqual(try Data(contentsOf: url), Data("foreign".utf8))
+                }
+            }
+            let commands = try ftp?.commands() ?? ssh!.commands()
+            XCTAssertFalse(commands.contains { ["DELE", "RNFR", "RNTO", "REMOVE", "RENAME", "SETSTAT"].contains($0["command"] ?? "") })
         }
     }
 }

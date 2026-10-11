@@ -1,5 +1,205 @@
 import XCTest
 
+final class DirectoryCreationTests: XCTestCase {
+    private var caFile: String {
+        URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".build/tls-fixtures/ca.pem").path
+    }
+    private func path(_ names: [String], _ encoding: FTPTextEncoding = .utf8) throws -> RemotePath {
+        try names.reduce(RemotePath.root) { try $0.appending(name: $1, bytes: encoding.encode($1)) }
+    }
+    func testFTPAndFTPSDedicatedMKD257PreservesRawNamesWithoutDataTransfer() async throws {
+        for transport in [FileTransport.ftp, .ftpsExplicit, .ftpsImplicit] {
+            for scenario in ["normal", "legacy"] {
+                let fixture = try FTPFixture(scenario: scenario, transport: transport)
+                defer { fixture.stop() }
+                let client = FTPClient(caFile: caFile)
+                let encoding: FTPTextEncoding = scenario == "legacy" ? .gb18030 : .utf8
+                let name = "目录 中文 空格%#"
+                let directory = try path([name], encoding)
+                try await client.createDirectory(endpoint: fixture.endpoint, path: directory, encoding: encoding,
+                    credentials: .anonymous, cancellation: FTPCancellationToken())
+                try await client.createDirectory(endpoint: fixture.endpoint, path: path([name, "空目录"], encoding), encoding: encoding,
+                    credentials: .anonymous, cancellation: FTPCancellationToken())
+                XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent(name + "/空目录").path))
+                let logs = try fixture.commands()
+                XCTAssertEqual(logs.filter { $0["command"] == "MKD" }.map { $0["argument"] ?? "" }, [name, "空目录"])
+                XCTAssertFalse(logs.contains { ["STOR", "RETR", "LIST", "MLSD", "PASV", "EPSV", "DELE", "RNFR", "RNTO"].contains($0["command"] ?? "") })
+            }
+        }
+    }
+    @MainActor
+    func testAuthorizedPlanCreatesOnlyConfirmedDirectoryNodesAcrossProtocols() async throws {
+        for transport in [FileTransport.ftp, .ftpsExplicit, .ftpsImplicit, .sftp] {
+            let ftp = transport == .sftp ? nil : try FTPFixture(transport: transport)
+            let ssh = transport == .sftp ? try SFTPFixture() : nil
+            defer { ftp?.stop(); ssh?.stop() }
+            let remoteRoot = ftp?.root ?? ssh!.root, endpoint = ftp?.endpoint ?? ssh!.endpoint
+            let trust = HostTrustStore(url: remoteRoot.appendingPathComponent(".trust.json"))
+            if let ssh { try trust.trust(ssh.identity) }
+            let client = FTPClient(caFile: caFile, trust: trust)
+            let credentials = transport == .sftp ? try FTPCredentials.account(username: "member", password: "fixture-pass:@ ") : .anonymous
+            let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            let source = folder.appendingPathComponent("only-planned")
+            try FileManager.default.createDirectory(at: source.appendingPathComponent("空目录"), withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: folder) }
+            let sourceRoot = try LocalSourceRoot(url: source)
+            let plan = try await LocalTransferScanner().scan(roots: [sourceRoot], destination: .root, encoding: .utf8, cancellation: FTPCancellationToken())
+            let authorization = try UploadPlanAuthorization(plan: plan, endpoint: endpoint, destination: .root, credentials: credentials, client: client)
+            do { _ = try await authorization.executeDirectory(nodeID: plan.nodes[0].id); XCTFail("Unconfirmed plan executed") } catch {}
+            XCTAssertTrue(try (ftp?.commands() ?? ssh!.commands()).isEmpty)
+            XCTAssertTrue(authorization.confirm(planID: plan.id))
+            do { _ = try await authorization.executeDirectory(nodeID: plan.nodes[1].id); XCTFail("Child executed before parent") } catch {}
+            do { _ = try await authorization.executeDirectory(nodeID: UUID()); XCTFail("Outside node executed") } catch {}
+            XCTAssertTrue(try (ftp?.commands() ?? ssh!.commands()).isEmpty)
+            for node in plan.nodes { _ = try await authorization.executeDirectory(nodeID: node.id) }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: remoteRoot.appendingPathComponent("only-planned/空目录").path))
+            let commands = try ftp?.commands() ?? ssh!.commands()
+            let creates = commands.filter { ["MKD", "MKDIR"].contains($0["command"] ?? "") }
+            XCTAssertEqual(creates.count, 2)
+            XCTAssertFalse(commands.contains { ["STOR", "RETR", "OPEN", "DELE", "RNFR", "RNTO", "SITE", "REMOVE", "RENAME", "SETSTAT"].contains($0["command"] ?? "") })
+            let attachment = XCTAttachment(string: String(data: try JSONSerialization.data(withJSONObject: commands, options: [.prettyPrinted, .sortedKeys]), encoding: .utf8)!)
+            attachment.name = "directory-plan-commands-" + transport.rawValue
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+    }
+
+    func testCheckedCreationReusesDirectoriesAndRejectsFileAndLinkWithoutManagementCommands() async throws {
+        for sftp in [false, true] {
+            let ftp = sftp ? nil : try FTPFixture()
+            let ssh = sftp ? try SFTPFixture() : nil
+            defer { ftp?.stop(); ssh?.stop() }
+            let root = ftp?.root ?? ssh!.root, endpoint = ftp?.endpoint ?? ssh!.endpoint
+            let trust = HostTrustStore(url: root.appendingPathComponent(".trust.json"))
+            if let ssh { try trust.trust(ssh.identity) }
+            let client = FTPClient(trust: trust)
+            let credentials = sftp ? try FTPCredentials.account(username: "member", password: "fixture-pass:@ ") : .anonymous
+            try Data([1]).write(to: root.appendingPathComponent("occupied-file"))
+            try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("occupied-link"), withDestinationURL: root.appendingPathComponent("空目录"))
+            let reused = try await client.ensureDirectory(endpoint: endpoint, path: path(["空目录"]), encoding: .utf8,
+                credentials: credentials, cancellation: FTPCancellationToken())
+            XCTAssertEqual(reused, .reused)
+            for name in ["occupied-file", "occupied-link"] {
+                do {
+                    _ = try await client.ensureDirectory(endpoint: endpoint, path: path([name]), encoding: .utf8,
+                        credentials: credentials, cancellation: FTPCancellationToken())
+                    XCTFail("Type conflict accepted")
+                } catch { XCTAssertTrue(error is FTPError) }
+            }
+            let created = try await client.ensureDirectory(endpoint: endpoint, path: path(["planned-directory"]), encoding: .utf8,
+                credentials: credentials, cancellation: FTPCancellationToken())
+            XCTAssertEqual(created, .created)
+            let commands = try ftp?.commands() ?? ssh!.commands()
+            XCTAssertEqual(commands.filter { ["MKD", "MKDIR"].contains($0["command"] ?? "") }.count, 1)
+            XCTAssertFalse(commands.contains { ["DELE", "RNFR", "RNTO", "SITE", "REMOVE", "RENAME", "SETSTAT"].contains($0["command"] ?? "") })
+            XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("occupied-file")), Data([1]))
+        }
+    }
+
+    func testSFTPMkdirPasswordAndPrivateKeyAndDenial() async throws {
+        let fixture = try SFTPFixture(keyAuth: true)
+        defer { fixture.stop() }
+        let trust = HostTrustStore(url: fixture.root.appendingPathComponent(".trust.json"))
+        try trust.trust(fixture.identity)
+        let client = FTPClient(trust: trust)
+        let key = try PrivateKeyAccess().read(fixture.root.appendingPathComponent(".keys/openssh-ed25519"))
+        let identities = [try FTPCredentials.account(username: "member", password: "fixture-pass:@ "),
+                          try FTPCredentials.key(username: "member", material: key, passphrase: nil)]
+        for (i, credentials) in identities.enumerated() {
+            let names = ["目录 中文%# \(i)"]
+            try await client.createDirectory(endpoint: fixture.endpoint, path: path(names), encoding: .utf8,
+                credentials: credentials, cancellation: FTPCancellationToken())
+            XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent(names[0]).path))
+            do {
+                try await client.createDirectory(endpoint: fixture.endpoint, path: path(["拒绝写入", "denied-\(i)"]), encoding: .utf8,
+                    credentials: credentials, cancellation: FTPCancellationToken())
+                XCTFail("Denied SFTP mkdir succeeded")
+            } catch { XCTAssertTrue(error.localizedDescription.contains("SFTP 3")) }
+        }
+        let commands = try fixture.commands()
+        XCTAssertEqual(commands.filter { $0["command"] == "MKDIR" }.count, 4)
+        XCTAssertTrue(commands.contains { $0["command"] == "AUTH_KEY" })
+        XCTAssertFalse(commands.contains { ["OPEN", "REMOVE", "RENAME", "SETSTAT"].contains($0["command"] ?? "") })
+    }
+
+    func testSFTPHostChangePreventsAuthenticationAndMkdir() async throws {
+        let fixture = try SFTPFixture()
+        defer { fixture.stop() }
+        let trust = HostTrustStore(url: fixture.root.appendingPathComponent(".trust.json"))
+        try trust.trust(SSHHostIdentity(host: fixture.endpoint.host, port: fixture.endpoint.port, key: Data([1, 2, 3])))
+        do {
+            try await FTPClient(trust: trust).createDirectory(endpoint: fixture.endpoint, path: path(["not-created"]), encoding: .utf8,
+                credentials: FTPCredentials.account(username: "member", password: "fixture-pass:@ "), cancellation: FTPCancellationToken())
+            XCTFail("Changed host mkdir succeeded")
+        } catch { XCTAssertTrue(error is HostTrustError) }
+        XCTAssertFalse(try fixture.commands().contains { ["MKDIR", "AUTH", "AUTH_KEY"].contains($0["command"] ?? "") })
+    }
+
+    func testSFTPCancelMkdirFinalAcknowledgementHasBoundedCleanup() async throws {
+        let fixture = try SFTPFixture(delay: 10)
+        defer { fixture.stop() }
+        let trust = HostTrustStore(url: fixture.root.appendingPathComponent(".trust.json"))
+        try trust.trust(fixture.identity)
+        let token = FTPCancellationToken()
+        let target = try path(["等待确认", "created"])
+        let credentials = try FTPCredentials.account(username: "member", password: "fixture-pass:@ ")
+        let task = Task {
+            try await FTPClient(trust: trust).createDirectory(endpoint: fixture.endpoint, path: target, encoding: .utf8,
+                credentials: credentials, cancellation: token)
+        }
+        let deadline = Date().addingTimeInterval(3)
+        while !(try fixture.commands().contains { $0["command"] == "MKDIR" }) && Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(try fixture.commands().contains { $0["command"] == "MKDIR" })
+        let began = Date(); token.cancel()
+        do { try await task.value; XCTFail("Cancelled SFTP mkdir succeeded") } catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertLessThan(Date().timeIntervalSince(began), 2)
+        XCTAssertFalse(try fixture.commands().contains { ["REMOVE", "RENAME", "SETSTAT"].contains($0["command"] ?? "") })
+    }
+
+    func testRejectedExistingAndWrongSuccessCodeAreNotAccepted() async throws {
+        let fixture = try FTPFixture()
+        defer { fixture.stop() }
+        let client = FTPClient()
+        for names in [["空目录"], ["拒绝写入", "new"], ["最终拒绝", "wrong-code"]] {
+            do {
+                try await client.createDirectory(endpoint: fixture.endpoint, path: path(names), encoding: .utf8,
+                    credentials: .anonymous, cancellation: FTPCancellationToken())
+                XCTFail("MKD accepted an existing/refused target or wrong final code")
+            } catch { XCTAssertTrue(error is FTPError) }
+        }
+        XCTAssertEqual(try fixture.commands().filter { $0["command"] == "MKD" }.count, 3)
+        let invalid = RemotePath(components: [.init(name: "bad", bytes: Data("bad\r\nDELE victim".utf8))])
+        do {
+            try await client.createDirectory(endpoint: fixture.endpoint, path: invalid, encoding: .utf8,
+                credentials: .anonymous, cancellation: FTPCancellationToken())
+            XCTFail("Command injection accepted")
+        } catch { XCTAssertTrue(error is FTPError) }
+        XCTAssertFalse(try fixture.commands().contains { $0["command"] == "DELE" })
+    }
+    func testCancelDuringDelayedMKDWaitsForBackendAndLeavesPossibleDirectory() async throws {
+        let fixture = try FTPFixture(delay: 10)
+        defer { fixture.stop() }
+        let token = FTPCancellationToken()
+        let target = try path(["等待确认", "created"])
+        let task = Task {
+            try await FTPClient().createDirectory(endpoint: fixture.endpoint, path: target, encoding: .utf8,
+                credentials: .anonymous, cancellation: token)
+        }
+        let deadline = Date().addingTimeInterval(3)
+        while !(try fixture.commands().contains { $0["command"] == "MKD" }) && Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(try fixture.commands().contains { $0["command"] == "MKD" })
+        let began = Date(); token.cancel()
+        do { try await task.value; XCTFail("Cancelled MKD succeeded") } catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertLessThan(Date().timeIntervalSince(began), 2)
+        XCTAssertFalse(try fixture.commands().contains { $0["command"] == "DELE" })
+    }
+}
+
 final class DirectoryTests: XCTestCase {
     func testCancellationIsIdempotentAndDoesNotAffectNextOperation() async throws {
         let fixture = try FTPFixture()
@@ -96,6 +296,17 @@ final class DirectoryTests: XCTestCase {
         }
     }
 
+    func testListingDataLimitExactAndOneByteBeyond() throws {
+        let prefix = Data("type=file;size=0; ".utf8)
+        var data = prefix
+        data.append(Data(repeating: 97, count: TransferPlan.maximumListingBytes - prefix.count - 1))
+        data.append(10)
+        XCTAssertEqual(data.count, TransferPlan.maximumListingBytes)
+        XCTAssertEqual(try DirectoryParser.parse(data, machineReadable: true, preferredEncoding: .utf8).entries.count, 1)
+        data.append(10)
+        XCTAssertThrowsError(try DirectoryParser.parse(data, machineReadable: true, preferredEncoding: .utf8))
+    }
+
     func testExplicitListingNeverSilentlyChangesEncoding() throws {
         let gb = try FTPTextEncoding.gb18030.encode("type=dir; 共享\r\n")
         XCTAssertThrowsError(try DirectoryParser.parse(gb, machineReadable: true, preferredEncoding: .utf8))
@@ -138,6 +349,43 @@ final class DirectoryTests: XCTestCase {
             } catch { XCTAssertTrue(error is FTPError) }
         }
         XCTAssertTrue(try fixture.commands().isEmpty)
+    }
+
+    func testRealEntryTypesPreserveNamesAndDirectoryFirstSorting() throws {
+        for encoding in [FTPTextEncoding.utf8, .gb18030] {
+            let machine = "type=file;size=12; 普通 中文%#\r\ntype=dir; 目录\r\ntype=OS.unix=slink:/outside; 链接 中文\r\ntype=OS.unix=fifo; 管道\r\ntype=vendor; 未知\r\n"
+            let unix = "-rw-r--r-- 1 ftp ftp 12 Oct 03 2026 普通 中文%#\r\ndrwxr-xr-x 1 ftp ftp 0 Oct 03 2026 目录\r\nlrwxrwxrwx 1 ftp ftp 9 Oct 03 2026 链接 中文 -> /outside\r\nprw------- 1 ftp ftp 0 Oct 03 2026 管道\r\ncrw------- 1 ftp ftp 1, 3 Oct 03 2026 设备\r\n"
+            for (text, mlsd) in [(machine, true), (unix, false)] {
+                let listing = try DirectoryParser.parse(encoding.encode(text), machineReadable: mlsd, preferredEncoding: encoding)
+                XCTAssertEqual(listing.entries.first?.kind, .directory)
+                for (name, kind) in [("普通 中文%#", RemoteEntry.Kind.regularFile), ("目录", .directory), ("链接 中文", .symbolicLink), ("管道", .other)] {
+                    let entry = try XCTUnwrap(listing.entries.first { $0.name == name })
+                    XCTAssertEqual(entry.kind, kind)
+                    XCTAssertEqual(entry.rawName, try encoding.encode(name))
+                    XCTAssertEqual(entry.size, kind == .regularFile ? 12 : nil)
+                }
+                XCTAssertEqual(listing.entries.first { $0.name == (mlsd ? "未知" : "设备") }?.kind, mlsd ? .unknown : .other)
+            }
+        }
+        let old = RemoteEntry(name: "file", rawName: Data("file".utf8), isDirectory: false, size: 0)
+        XCTAssertEqual(old.kind, .regularFile)
+    }
+
+    func testSFTPClassifiesLinksSpecialAndMissingPermissions() async throws {
+        let fixture = try SFTPFixture(scenario: "entry-types")
+        defer { fixture.stop() }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "/hosts.json")
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let trust = HostTrustStore(url: url)
+        try trust.trust(fixture.identity)
+        let listing = try await FTPClient(trust: trust).list(endpoint: fixture.endpoint, path: .root,
+            credentials: FTPCredentials.account(username: "member", password: "fixture-pass:@ "))
+        for (name, kind) in [("普通 中文%#", RemoteEntry.Kind.regularFile), ("目录", .directory), ("链接", .symbolicLink), ("管道", .other), ("未知", .unknown)] {
+            let entry = try XCTUnwrap(listing.entries.first { $0.name == name })
+            XCTAssertEqual(entry.kind, kind)
+            XCTAssertEqual(entry.rawName, Data(name.utf8))
+            XCTAssertEqual(entry.size, kind == .regularFile ? 12 : nil)
+        }
     }
 
     func testMachineListingWithUnicodeSpacesAndDotEntries() throws {

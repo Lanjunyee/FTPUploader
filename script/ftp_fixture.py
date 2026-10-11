@@ -123,22 +123,26 @@ class Handler(socketserver.StreamRequestHandler):
         directory = self.path('.')[1]
         rows = []
         for entry in sorted(directory.iterdir()):
-            if entry.name.startswith('.'):
+            # Keep fixture controls private, but expose the collection-test payload.
+            if entry.name.startswith('.') and entry.name != '.hidden':
                 continue
             if entry.name == '账户资料' and self.user != 'member':
                 continue
             if entry.name == '访客资料' and self.user != 'guest':
                 continue
-            is_dir = entry.is_dir()
-            size = 0 if is_dir else entry.stat().st_size
+            is_link = entry.is_symlink()
+            is_dir = not is_link and entry.is_dir()
+            size = 0 if is_dir else entry.lstat().st_size
             if command == 'MLSD':
-                rows.append(f'type={"dir" if is_dir else "file"};size={size};modify=20261003000000; {entry.name}')
+                kind = 'OS.unix=slink' if is_link else ('dir' if is_dir else 'file')
+                rows.append(f'type={kind};size={size};modify=20261003000000; {entry.name}')
             elif self.cwd == '/DOS':
                 kind = '<DIR>' if is_dir else str(size)
                 rows.append(f'10-03-26  12:00PM       {kind}          {entry.name}')
             else:
-                kind = 'd' if is_dir else '-'
-                rows.append(f'{kind}rwxr-xr-x 1 ftp ftp {size} Oct 03 12:00 {entry.name}')
+                kind = 'l' if is_link else ('d' if is_dir else '-')
+                name = entry.name + (' -> ' + str(entry.readlink()) if is_link else '')
+                rows.append(f'{kind}rwxr-xr-x 1 ftp ftp {size} Oct 03 12:00 {name}')
         if self.cwd == '/' and args.scenario.endswith('empty-root'):
             rows = []
         elif self.cwd == '/' and args.scenario.endswith('ascii-root'):
@@ -265,6 +269,17 @@ class Handler(socketserver.StreamRequestHandler):
                     else:
                         self.cwd = path
                         self.reply(250, 'Directory changed')
+                elif command == 'MKD':
+                    path, directory = self.path(argument)
+                    if path.startswith('/拒绝写入/') or path.startswith('/空间不足/'):
+                        self.reply(550, 'Directory creation denied')
+                    else:
+                        try:
+                            directory.mkdir()
+                            if path.startswith('/等待确认/'): time.sleep(args.delay)
+                            self.reply(250 if path.startswith('/最终拒绝/') else 257, 'Directory created')
+                        except OSError:
+                            self.reply(550, 'Directory already exists or cannot be created')
                 elif command == 'EPSV': self.passive(True)
                 elif command == 'PASV': self.passive(False)
                 elif command in ['MLSD', 'LIST', 'NLST']: self.listing(command)

@@ -38,6 +38,7 @@ for library in libssh2.a libcrypto.a; do
   lipo -create "$DEP_ROOT/arm64/install/lib/$library" "$DEP_ROOT/x86_64/install/lib/$library" -output "$DEP_ROOT/universal/lib/$library"
 done
 cp "$DEP_ROOT/arm64/install/include/libssh2"*.h "$DEP_ROOT/universal/include/"
+cp -R "$DEP_ROOT/arm64/install/include/openssl" "$DEP_ROOT/universal/include/"
 cp "$DEP_ROOT/arm64/libssh2-$SSH_VERSION/COPYING" "$DEP_ROOT/licenses/libssh2-COPYING"
 cp "$DEP_ROOT/arm64/openssl-$SSL_VERSION/LICENSE.txt" "$DEP_ROOT/licenses/OpenSSL-LICENSE.txt"
 lipo -info "$DEP_ROOT/universal/lib/libssh2.a"

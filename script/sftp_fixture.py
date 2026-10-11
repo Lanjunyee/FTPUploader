@@ -3,26 +3,55 @@
 import argparse, base64, json, os, posixpath, signal, socket, stat, tempfile, threading, time
 from pathlib import Path
 import paramiko
+from cryptography.hazmat.primitives.asymmetric import rsa, ed25519, ec
+from cryptography.hazmat.primitives import serialization
 from paramiko.sftp import CMD_CLOSE
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--port',type=int,default=0)
-parser.add_argument('--scenario',default='normal',choices=['normal','slow-list','slow-upload','delay-close','reject-close','disconnect','deny-login','invalid-utf8'])
+parser.add_argument('--scenario',default='normal',choices=['normal','slow-auth','slow-list','slow-upload','delay-close','reject-close','disconnect','deny-login','invalid-utf8','entry-types'])
+parser.add_argument('--key-auth', action='store_true')
 parser.add_argument('--delay',type=float,default=2)
 args=parser.parse_args()
 temporary=tempfile.TemporaryDirectory(prefix='sftp-fixture-');root=Path(temporary.name).resolve()
 for directory in ('中文 空格%#','空目录','拒绝访问','拒绝写入','等待确认'):(root/directory).mkdir()
 (root/'中文 空格%#'/'已提交.txt').write_bytes(b'protected\n')
 key=paramiko.RSAKey.generate(2048)
+authorized_keys = set()
+if args.key_auth:
+    keydir = root/'.keys'; keydir.mkdir()
+    rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ed_key = ed25519.Ed25519PrivateKey.generate()
+    for name, source, fmt in [('openssh-ed25519', ed_key, serialization.PrivateFormat.OpenSSH),
+                              ('openssh-rsa', rsa_key, serialization.PrivateFormat.OpenSSH),
+                              ('pem-rsa', rsa_key, serialization.PrivateFormat.TraditionalOpenSSL),
+                              ('pkcs8-rsa', rsa_key, serialization.PrivateFormat.PKCS8)]:
+        public = source.public_key().public_bytes(serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH)
+        authorized_keys.add(public.split()[1].decode())
+        for encrypted in (False, True):
+            encryption = serialization.BestAvailableEncryption(' 密钥口令:@ '.encode()) if encrypted else serialization.NoEncryption()
+            data = source.private_bytes(serialization.Encoding.PEM, fmt, encryption)
+            target = keydir/(name+('-encrypted' if encrypted else ''))
+            target.write_bytes(data); target.chmod(0o600)
+    unsupported = ec.generate_private_key(ec.SECP256R1())
+    for name, fmt in [('unsupported-pem-ec', serialization.PrivateFormat.PKCS8),
+                       ('unsupported-openssh-ec', serialization.PrivateFormat.OpenSSH)]:
+        target = keydir/name
+        target.write_bytes(unsupported.private_bytes(serialization.Encoding.PEM, fmt, serialization.NoEncryption()))
+        target.chmod(0o600)
 log=root/'.commands.jsonl';log.touch();lock=threading.Lock()
 def record(command,path=''):
     with lock:
         with log.open('a') as out: out.write(json.dumps({'command':command,'path':path},ensure_ascii=False)+'\n')
 class Server(paramiko.ServerInterface):
     def __init__(self,transport):self.transport=transport
-    def get_allowed_auths(self,username):return 'password'
+    def get_allowed_auths(self,username):return 'publickey,password' if args.key_auth else 'password'
     def check_auth_password(self,username,password):
         record('AUTH')
         return paramiko.AUTH_SUCCESSFUL if username=='member' and password=='fixture-pass:@ ' and args.scenario!='deny-login' else paramiko.AUTH_FAILED
+    def check_auth_publickey(self,username,key):
+        record('AUTH_KEY')
+        if args.scenario=='slow-auth':time.sleep(args.delay)
+        return paramiko.AUTH_SUCCESSFUL if username=='member' and key.get_base64() in authorized_keys and args.scenario!='deny-login' else paramiko.AUTH_FAILED
     def check_channel_request(self,kind,chanid):return paramiko.OPEN_SUCCEEDED if kind=='session' else paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
 class Handle(paramiko.SFTPHandle):
     def stat(self):
@@ -51,14 +80,37 @@ class Files(paramiko.SFTPServerInterface):
         try:
             entries=[]
             for child in sorted(self.local(path).iterdir()):
-                if child.name.startswith('.'):continue
-                attr=paramiko.SFTPAttributes.from_stat(child.stat());attr.filename=child.name
+                # Control/key artifacts stay private; .hidden is a test payload.
+                if child.name.startswith('.') and child.name != '.hidden':continue
+                attr=paramiko.SFTPAttributes.from_stat(child.lstat());attr.filename=child.name
                 entries.append(attr)
+            if args.scenario=='entry-types':
+                entries=[]
+                for name,mode in [('普通 中文%#',stat.S_IFREG),('目录',stat.S_IFDIR),('链接',stat.S_IFLNK),('管道',stat.S_IFIFO),('未知',None)]:
+                    attr=paramiko.SFTPAttributes();attr.filename=name;attr.st_size=12
+                    if mode is not None:attr.st_mode=mode|0o644
+                    entries.append(attr)
             if args.scenario=='invalid-utf8':
                 attr=paramiko.SFTPAttributes();attr.st_mode=stat.S_IFREG|0o644;attr.filename=b'bad\xff';entries=[attr]
             return entries
         except OSError as error:
             record('LIST_ERROR',str(error));return paramiko.SFTP_NO_SUCH_FILE
+    def mkdir(self,path,attr):
+        record('MKDIR',path)
+        if path.startswith('/拒绝写入/'):return paramiko.SFTP_PERMISSION_DENIED
+        try:
+            self.local(path).mkdir(mode=0o755)
+            if path.startswith('/等待确认/'):time.sleep(args.delay)
+            return paramiko.SFTP_OK
+        except OSError:return paramiko.SFTP_FAILURE
+    def remove(self,path):
+        record('REMOVE',path);return paramiko.SFTP_OP_UNSUPPORTED
+    def rmdir(self,path):
+        record('RMDIR',path);return paramiko.SFTP_OP_UNSUPPORTED
+    def rename(self,oldpath,newpath):
+        record('RENAME',oldpath+' -> '+newpath);return paramiko.SFTP_OP_UNSUPPORTED
+    def chattr(self,path,attr):
+        record('SETSTAT',path);return paramiko.SFTP_OP_UNSUPPORTED
     def stat(self,path):
         try:return paramiko.SFTPAttributes.from_stat(self.local(path).stat())
         except OSError:return paramiko.SFTP_NO_SUCH_FILE

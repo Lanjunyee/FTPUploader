@@ -2,6 +2,8 @@
 
 本阶段固定 libssh2 1.11.1（BSD 风格许可证）与 OpenSSL 3.5.9 LTS（Apache-2.0）。来源为 [libssh2 官方发布](https://github.com/libssh2/libssh2/releases/tag/libssh2-1.11.1) 与 [OpenSSL 官方发布](https://github.com/openssl/openssl/releases/tag/openssl-3.5.9)。官方 [OpenSSL 生命周期](https://openssl-library.org/source/)列出 3.5 LTS 支持至 2030-04-08。版本及 SHA256 固定在 `script/build_secure_dependencies.sh`；OpenSSL 摘要与官方随包 SHA256 一致。许可全文位于本目录的 `licenses/`，发行包必须包含这两个许可。
 
+当前应用与测试源码最低 macOS 15；下文静态依赖的 macOS 13 编译目标及历史验证记录不代表应用仍支持 macOS 13／14。
+
 开发机需 Xcode、CMake、Perl、make、curl；用户运行应用无需安装这些工具或 Homebrew。执行 `script/build_secure_dependencies.sh` 从官方源下载并验证摘要，分别用 macOS 13 部署目标编译 arm64/x86_64，合并静态 libssh2 与 libcrypto。关闭动态模块、外部 engine 和 zlib 压缩，应用静态链接两库，不加载用户安装的加密库。产物位于 `.build/secure-deps/universal/`，不将 Homebrew 单架构二进制当发布依赖。
 
 测试 SSH 服务使用项目隔离环境：用 Python 3.12 建立 `.build/ssh-fixture-env`，安装 `paramiko==4.0.0`。这是本机测试依赖，不随应用打包。执行 `script/verify_ssh_dependencies.sh` 构建两架构最小探针，并置于具有本应用网络客户端沙盒权限的应用包中签名，验证无认证握手及取消。

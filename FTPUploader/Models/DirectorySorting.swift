@@ -52,3 +52,136 @@ enum DirectorySorting {
         lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
     }
 }
+
+/// Pure local projection; never rebuilds entries or remote identity from display text.
+enum DirectoryFiltering {
+    struct Projection {
+        let entries: [RemoteEntry]
+        let selectedIDs: Set<Data>
+        var selectedEntries: [RemoteEntry] {
+            RemoteDirectorySelection.selected(in: entries, ids: selectedIDs)
+        }
+        var folderToOpen: RemoteEntry? { RemoteDirectorySelection.uniqueFolder(selectedEntries) }
+        var downloadRoute: RemoteDirectorySelection.DownloadRoute? {
+            RemoteDirectorySelection.downloadRoute(selectedEntries)
+        }
+    }
+
+    static func project(_ entries: [RemoteEntry], query: String,
+                        sort: DirectorySortColumn, ascending: Bool,
+                        selectedIDs: Set<Data>) -> Projection {
+        let visible = DirectorySorting.sorted(filtered(entries, query: query), by: sort, ascending: ascending)
+        return Projection(entries: visible, selectedIDs: selectedIDs.intersection(Set(visible.map(\.id))))
+    }
+
+    static func filtered(_ entries: [RemoteEntry], query: String) -> [RemoteEntry] {
+        guard !query.isEmpty else { return entries }
+        let needle = query.precomposedStringWithCanonicalMapping
+        return entries.filter {
+            $0.name.precomposedStringWithCanonicalMapping.range(
+                of: needle, options: [.caseInsensitive, .literal],
+                locale: Locale(identifier: "en_US_POSIX")) != nil
+        }
+    }
+}
+
+struct DirectoryContext: Equatable {
+    let identity: FTPIdentity
+    let path: RemotePath
+}
+
+struct DirectorySelectionTicket {
+    let revision: UInt64
+    let entries: [RemoteEntry]
+    func isCurrent(revision: UInt64, entries: [RemoteEntry]) -> Bool {
+        self.revision == revision && self.entries == entries && !entries.isEmpty
+    }
+}
+
+/// Pure lifetime rule; refresh generations are deliberately not part of context.
+enum DirectoryFilterLifetime {
+    static func shouldReset(from old: DirectoryContext?, to new: DirectoryContext?) -> Bool { old != new }
+}
+
+enum DirectoryFeedback: Equatable {
+    case reading, failed, empty, noMatches, ready
+    static func resolve(loaded: Int, visible: Int, isReading: Bool, hasError: Bool) -> Self {
+        if isReading { return .reading }
+        if hasError { return .failed }
+        if loaded == 0 { return .empty }
+        return visible == 0 ? .noMatches : .ready
+    }
+}
+
+/// Window-local cache. Only directory/query/sort events update it, not byte progress.
+struct DirectoryProjectionCache {
+    private struct Input: Equatable {
+        let entries: [RemoteEntry]
+        let query: String
+        let sort: DirectorySortColumn
+        let ascending: Bool
+    }
+    private var input: Input?
+    private(set) var entries: [RemoteEntry] = []
+    private(set) var projectionCount = 0
+
+    mutating func update(_ loaded: [RemoteEntry], query: String,
+                         sort: DirectorySortColumn, ascending: Bool) {
+        let next = Input(entries: loaded, query: query, sort: sort, ascending: ascending)
+        guard input != next else { return }
+        entries = DirectorySorting.sorted(DirectoryFiltering.filtered(loaded, query: query), by: sort, ascending: ascending)
+        input = next
+        projectionCount += 1
+    }
+    func isCurrent(_ loaded: [RemoteEntry], query: String,
+                   sort: DirectorySortColumn, ascending: Bool) -> Bool {
+        input == Input(entries: loaded, query: query, sort: sort, ascending: ascending)
+    }
+}
+
+/// Read-only selection routing, shared by table/menu availability and model guards.
+/// Selection and sorting themselves never schedule navigation or content requests.
+enum RemoteDirectorySelection {
+    enum Action: String, Identifiable {
+        case openFolder, download, information
+        var id: String { rawValue }
+    }
+    struct ActionItem: Identifiable, Equatable {
+        let id: Action
+        let title: String
+        let enabled: Bool
+    }
+    static func actions(for entries: [RemoteEntry], isBusy: Bool) -> [ActionItem] {
+        var items: [ActionItem] = []
+        if uniqueFolder(entries) != nil {
+            items.append(ActionItem(id: .openFolder, title: "打开所选文件夹", enabled: !isBusy))
+        }
+        if downloadRoute(entries) != nil {
+            let title = entries.count == 1 ? (entries[0].isDirectory ? "下载文件夹…" : "下载文件…") : "下载所选项目…"
+            items.append(ActionItem(id: .download, title: title, enabled: !isBusy))
+        }
+        if entries.count == 1 {
+            items.append(ActionItem(id: .information, title: "文件信息／完整名称", enabled: true))
+        }
+        return items
+    }
+
+    enum DownloadRoute: Equatable {
+        case singleFile(RemoteEntry)
+        case collection([RemoteEntry])
+    }
+    static func selected(in orderedEntries: [RemoteEntry], ids: Set<Data>) -> [RemoteEntry] {
+        let selected = orderedEntries.filter { ids.contains($0.id) }
+        return selected.count == ids.count ? selected : []
+    }
+    static func uniqueFolder(_ entries: [RemoteEntry]) -> RemoteEntry? {
+        entries.count == 1 && entries[0].kind == .directory ? entries[0] : nil
+    }
+    static func downloadRoute(_ entries: [RemoteEntry]) -> DownloadRoute? {
+        guard !entries.isEmpty, entries.count <= TransferPlan.maximumNodes,
+              Set(entries.map(\.id)).count == entries.count,
+              entries.allSatisfy({ $0.kind == .regularFile || $0.kind == .directory }) else { return nil }
+        if entries.count == 1, entries[0].kind == .regularFile { return .singleFile(entries[0]) }
+        return .collection(entries)
+    }
+}

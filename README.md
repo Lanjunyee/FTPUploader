@@ -1,142 +1,116 @@
 <p align="center">
-  <img src="FTPUploader/Assets.xcassets/AppIcon.appiconset/icon_128x128@2x.png" width="96" height="96" alt="FTPUploader 应用图标：蓝色文件夹与上传箭头">
+  <img src="FTPUploader/Assets.xcassets/AppIcon.appiconset/icon_128x128@2x.png" width="88" height="88" alt="FTPUploader：蓝色文件夹与传输箭头">
 </p>
 
 <h1 align="center">FTP 文件传输</h1>
 
-<p align="center"><strong>连接服务器，找到目录，传输文件。</strong></p>
-<p align="center">一款轻量的 macOS FTP 客户端，让日常文件传输更直观。</p>
+<p align="center"><strong>连接服务器，找到目录，安心传输。</strong></p>
+<p align="center">轻量的原生 macOS 客户端，为日常文件与文件夹传输而设计。</p>
 
 <p align="center">
-  <a href="https://github.com/Lanjunyee/FTPUploader/releases/latest">下载安装</a> ·
-  <a href="#能做什么">功能介绍</a> ·
-  <a href="#开始使用">开始使用</a>
+  <a href="https://github.com/Lanjunyee/FTPUploader/releases/latest"><img src="https://img.shields.io/github/v/release/Lanjunyee/FTPUploader?style=flat-square&label=release&color=0969da" alt="最新发布版本"></a>
+  <img src="https://img.shields.io/badge/source-macOS%2015%2B-57606a?style=flat-square" alt="当前源码需要 macOS 15 或更新版本">
+  <img src="https://img.shields.io/badge/UI-SwiftUI%20%2F%20AppKit-57606a?style=flat-square" alt="SwiftUI 与 AppKit 原生界面">
 </p>
 
-<p align="center"><sub>原生 macOS 界面 · Apple Silicon 与 Intel 通用安装包 · 浅色与深色外观</sub></p>
+<p align="center">
+  <a href="https://github.com/Lanjunyee/FTPUploader/releases/latest"><strong>下载已发布版本</strong></a> ·
+  <a href="#开始使用">快速上手</a> ·
+  <a href="docs/workbench.md">工作台指南</a> ·
+  <a href="https://github.com/Lanjunyee/FTPUploader/issues">反馈问题</a>
+</p>
 
----
+> **版本说明**：下面展示新版源码中的紧凑工作台。最新安装包 **v0.2.0 不包含此工作台、文件夹传输和 SFTP 私钥登录**；安装包能力与系统要求以 [Release 说明](https://github.com/Lanjunyee/FTPUploader/releases/latest) 为准。新版源码最低 macOS 15，目前未发布新安装包。
 
 <p align="center">
-  <img src="docs/readme/upload-success.png" width="820" alt="FTP 文件传输的浅色界面：远程目录、已选文件、上传目标和服务器确认后的上传成功状态">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/readme/workbench-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/readme/workbench-light.png">
+    <img src="docs/readme/workbench-light.png" width="820" alt="新版源码工作台：当前目录筛选、名称与大小列、紧凑工具栏和独立开始上传；截图含长中文测试文件名">
+  </picture>
   <br>
-  <sub>目录浏览与文件上传集中在一个窗口。截图使用本机测试服务器。</sub>
+  <sub>真实本机测试服务器截图 · 跟随浅色／深色外观 · 支持系统强调色</sub>
 </p>
 
-当前版本 `v0.2.0` 支持 FTPS / SFTP、下载与批量上传队列，通用安装包见下载页。
+## 简洁界面，完整流程
 
-## 能做什么
+| 找到文件 | 核对后传输 | 看清每一步 |
+| :--- | :--- | :--- |
+| 站点收藏、目录排序、本地文件名筛选 | 单文件、文件夹与混合选择；先预览，再明确开始 | 双向摘要、完整队列、失败原因与最近记录 |
 
-- **连接 FTP / FTPS / SFTP** — FTP 家族支持匿名或账户密码，FTPS 提供显式和隐式 TLS，SFTP 使用账户密码。
-- **管理常用站点** — 保存服务器配置，按需将密码存入系统钥匙串。
-- **浏览远程目录** — 双击进入文件夹，按名称、类型或大小排序。
-- **上传与下载普通文件** — 单文件上传、预览后串行批量上传，以及通过系统保存界面下载。
-- **查看队列和记录** — 速度与剩余时间估算、明确取消和重试、最近 100 条本机结果。
-
-适合向已有 FTP 服务器提交作业、文档或其他文件。
+- **原生工作台**：可折叠站点栏，名称／大小为主的目录表格，完整位置与文件信息按需展开。浅深色自动适配，不用额外主题。
+- **双向文件传输**：上传与下载保留文件夹名称、嵌套结构和空目录；覆盖需明确决策，失败项先生成新重试计划，不会自动重传。
+- **按服务器选择协议**：FTP、显式／隐式 FTPS、SFTP；账户密码可选系统钥匙串，SFTP 可使用本地私钥，证书与主机指纹严格核验。
 
 ## 开始使用
 
-1. 从 [Releases](https://github.com/Lanjunyee/FTPUploader/releases/latest) 下载通用 ZIP 安装包，解压后将 `FTPUploader.app` 放入“应用程序”文件夹。
-2. 填写服务器地址，例如 `ftp://example.com:21/uploads`，选择登录方式，点击“连接”。
-3. 双击进入目标文件夹，点击“选择文件…”，或从 Finder 将一个普通文件拖入目录区域或底部上传条，再点击“上传到当前目录”，等待“上传成功”。拖入只选择文件，不会自动上传。
+1. **连接**：填写地址，例如 `ftp://example.com:21/uploads`，选择协议与登录方式，点击“连接”。选择站点或保存配置不会自动连接。
+2. **定位**：双击文件夹进入目录；点击筛选图标，仅匹配当前已加载项目。它不是全站搜索，不刷新服务器，清除筛选不会恢复隐藏选择。
+3. **传输**：从“上传”菜单选择文件，点击独立开始按钮；文件夹或混合选择先核对预览。下载通过所选项目菜单选择保存位置，文件夹或多选须确认计划后才开始。
 
-常用服务器可在站点菜单或“设置…”中保存，下次选择后点击“连接”即可。
-
-## 使用前了解
-
-- 普通 FTP 不加密。FTPS 的控制与数据连接均加密，必须通过系统证书链和主机名校验；不支持跳过校验或自签名例外。
-- 支持普通文件单个下载和串行批量上传，暂不支持文件夹传输或续传。SFTP 第一版仅支持账户密码与严格 UTF-8 文件名，不支持私钥、SSH agent 或跳板机。
-- 检查发现同名普通文件时须确认本次覆盖；检查与写入并非原子操作，服务器并发变化仍可能导致覆盖。传输中断或取消后可能留下部分文件，应用不会自动删除或重试。
-- 当前安装包采用本地签名，**未经过 Apple 公证**，首次打开可能被 macOS 拦截。
-- 系统 API 基线为 macOS 13；最低系统版本和 Intel 真机运行尚未实测。
-
----
-
-## 开发
-
-SwiftUI / AppKit 构建原生界面，系统 libcurl 负责 FTP/FTPS，固定版本 libssh2 与 OpenSSL 静态链接负责 SFTP。依赖来源、许可和双架构构建见 [依赖说明](docs/secure-dependencies.md)。
+选择、拖入、排序、查看详情或普通文件双击，都不会直接传输。
 
 <details>
-<summary>构建、测试与本机 FTP 夹具</summary>
+<summary><strong>常用快捷键</strong></summary>
 
-### 构建与运行
+| 操作 | 快捷键 |
+| --- | --- |
+| 选择单个上传文件 | `⌘O` |
+| 上传文件／文件夹预览 | `⌘⇧B` |
+| 开始单文件上传 | `⌘⇧U` |
+| 下载所选项目 | `⌘D` |
+| 筛选当前目录 | `⌘F` |
+| 文件信息／完整名称 | `⌘I` |
+| 打开唯一选中文件夹 | `⌘Return` |
+| 队列与记录 | `⌘⇧H` |
+| 取消当前操作 | `⌘.` |
 
-需要 Xcode、macOS SDK 及依赖构建工具。先运行 `./script/build_secure_dependencies.sh`，再打开 `FTPUploader.xcodeproj`，选择 FTPUploader scheme，或运行：
-
-```sh
-./script/build_and_run.sh --verify
-```
-
-产物位于 `dist/FTPUploader.app`。脚本还支持 `--debug`、`--logs` 与 `--telemetry`。
-
-### 自动化测试
-
-```sh
-xcodebuild -project FTPUploader.xcodeproj -scheme FTPUploader \
-  -destination 'platform=macOS,arch=arm64' -derivedDataPath .build/xcode test
-```
-
-测试环境需要 macOS 14 或更新版本。测试覆盖地址与目录编码、站点和凭据管理、错误脱敏及上传结果等行为。
-
-### 本机 FTP 夹具
-
-```sh
-/usr/bin/python3 script/ftp_fixture.py --port 2121
-```
-
-连接 `ftp://127.0.0.1:2121`。服务仅监听本机地址，使用临时数据，停止后自动清理。
+快捷键与按钮使用相同安全守卫。覆盖提示中 Return 默认取消；取消请求发出后，资源释放前仍保持锁定。
 
 </details>
 
-### 取消操作
+## 使用前了解
 
-连接、读取目录、上传和等待最终确认期间，可使用工具栏的“取消当前操作”或传输菜单的 `⌘.`。界面先显示“正在取消”，底层停止前仍锁定目标和文件；停止后可发起新操作。目录取消保留此前有效目录。上传取消显示本次目标，远程可能已经存在部分或完整文件；应用不会删除、回滚或自动重试。已经显示的服务器确认成功不会被随后取消改写。
+- **FTP 不加密**。建议使用服务器支持的 FTPS 或 SFTP。FTPS 不提供跳过证书校验；SFTP 首次连接需独立核对指纹，密钥变化会阻止认证与传输。
+- **不是整目录原子操作**。失败或取消保留已成功文件与已创建目录；不自动删除、回滚或重试。不支持续传、远程删除／改名／权限管理。
+- **覆盖仍有并发边界**。下载目标变化需重新确认；检查与写入并非服务端条件原子操作，不能消除非合作客户端的所有竞态。
+- **记录仅在本机**。最近 100 条记录包含文件名、服务器和路径，不含密码、私钥、口令或可恢复任务；重启不恢复队列。
+- **发行验证未完成**。本地构建仍为 ad-hoc 签名，不代表 Developer ID／公证验证。实际 macOS 15 与 Intel 真机尚未实测；Rosetta 与通用编译不能替代。下载版本的签名与要求以 Release 为准。
 
-### 上传前检查与覆盖
+## 开发与验证
 
-每次上传都会重新列出当前目标目录。同名普通文件弹出仅对本次目标有效的确认，回车默认取消；仅选择“仅本次覆盖”才发送文件。同名目录禁止发送，列表失败也禁止发送。因此只允许写入、不允许列目录的 dropbox 服务器暂不支持上传。
+当前源码最低 **macOS 15**。需要 Xcode、CMake、Perl、make 和 curl。FTP／FTPS 使用系统 libcurl，SFTP 静态链接固定版本的 libssh2 与 OpenSSL；[依赖来源和许可证](docs/secure-dependencies.md)随源码公开。
 
-目录检查与写入不是原子操作，服务器在两者之间仍可能被其他客户端修改；应用不承诺消除并发覆盖。确认绑定服务器、身份、路径及本地文件内容，改变后须重新检查。服务器仍可拒绝覆盖。应用不会远程删除、重命名、改权限、建目录、换身份、自动改名或自动重试。
+```sh
+# 准备固定版本、双架构的静态依赖
+./script/build_secure_dependencies.sh
 
-### 中文路径与文件名编码
+# 编译应用（不会发布或创建安装包）
+xcodebuild -project FTPUploader.xcodeproj -scheme FTPUploader \
+  -configuration Debug -derivedDataPath .build/xcode build
+```
 
-手动连接和站点设置可选择“自动”“UTF-8”或“GB18030”。自动模式先读取根目录，再按服务器返回名称的原始字节逐段进入中文初始目录；列表导航、上传前检查和上传使用同一有效编码。空目录或纯 ASCII 名称不能证明服务器编码，自动模式只尝试 UTF-8，失败时请明确选择服务器编码。
+自动测试需要本机 Python 3、TLS 测试证书，以及用于 SFTP 夹具的 Python 3.12 隔离环境：
 
-若根目录不可列出，选择 UTF-8/GB18030 可直接编码并访问目标初始路径。合法百分号路径保持原始字节，不会重复编码，也可直接访问。中文和空格可直接输入；文字中的 `%` 写成 `%25`、`#` 写成 `%23`。解析失败会指出失败段，不会把根目录当成上传目标。显式策略严格转换，不会用替代字符掩盖无法转换的名称。
+```sh
+python3 script/make_tls_fixtures.py .build/tls-fixtures
+python3.12 -m venv .build/ssh-fixture-env
+.build/ssh-fixture-env/bin/python -m pip install paramiko==4.0.0
 
-### FTPS 协议与证书
+xcodebuild -project FTPUploader.xcodeproj -scheme FTPUploader \
+  -destination 'platform=macOS,arch=arm64' \
+  -derivedDataPath .build/xcode test
+```
 
-协议选择器区分 FTP、显式 FTPS、隐式 FTPS 和 SFTP。FTP 与显式 FTPS 默认 21，隐式 FTPS 默认 990，SFTP 默认 22；自定义端口保持不变。`ftps://` 表示隐式 FTPS；显式 FTPS 选择对应模式并填主机名或 `ftp://` 地址。地址与选择冲突时本地拒绝。实际连接状态显示完整协议和安全模式。
+测试服务只监听 loopback，使用一次性资源，不需要真实服务器凭据。验证范围与缺失环境见 [源码验证记录](docs/source-verification.md)。
 
-FTPS 要求控制连接与数据连接都使用 TLS。证书过期、不可信、名称不符、服务器不支持 TLS 或加密数据连接失败都会阻止操作，没有自动降级或关闭校验入口。普通 FTP 仍可用，但切换协议须重新输入密码。旧站点与钥匙串迁移及回退见 [迁移说明](docs/secure-connections-migration.md)。
+## 文档与反馈
 
-FTPS 测试先运行 `python3 script/make_tls_fixtures.py .build/tls-fixtures` 创建仅测试使用的临时 CA 与证书。测试通过依赖注入添加 CA，应用界面和生产默认配置没有这个入口，系统信任不被修改。
+- [工作台指南](docs/workbench.md)：筛选、队列、覆盖、取消与历史。
+- [SFTP 私钥登录](docs/sftp-private-key-auth.md)：支持格式、口令及文件关联。
+- [安全协议迁移](docs/secure-connections-migration.md)：旧配置、钥匙串与降级边界。
+- [报告问题](https://github.com/Lanjunyee/FTPUploader/issues)：请附系统版本、应用版本与脱敏错误；不要上传密码、私钥或真实服务器敏感资料。
 
-### SFTP 服务器身份核验
+---
 
-首次连接在发送账户密码前显示主机、端口、密钥类型与 SHA256 指纹。请通过独立渠道向服务器管理员核对，只有明确选择“已核对，信任此主机”才保存并认证；取消不发送密码。信任记录以主机和端口区分，存于应用私有 Application Support 中的 `FTPUploader/known-hosts.json`，不含密码。
-
-已信任密钥变化时阻止认证和传输。核实后可使用“重置此主机的信任…”独立确认，随后仍须再次核对新指纹；重置不等于接受新密钥。存储损坏或写入失败会阻止继续，不能静默覆盖。SFTP 使用结构化目录属性与绝对 UTF-8 路径；单文件上传需写入及关闭操作都成功才显示成功，取消可能留下部分或完整远程文件。
-
-SFTP 测试需在 `.build/ssh-fixture-env` 建立 Python 3.12 隔离环境并安装 `paramiko==4.0.0`；仅监听本机地址，不使用真实服务器。发行构建静态链接后无需 Python、ssh 命令或 Homebrew。
-
-### 单文件下载
-
-选中普通远程文件后，使用右键菜单“下载…”或传输菜单“下载所选文件…”（`⌘D`），在系统保存界面选择本地位置。选择或双击文件不会下载；文件夹不能下载，取消保存选择不发送请求。
-
-FTP、两种 FTPS 和 SFTP 下载沿用实际连接身份、服务器验证及远程原始路径。内容先流式写入系统提供的目标同卷临时目录中的随机 `.ftpuploader-*.part` 文件，协议最终确认和本地关闭均成功后才提交。已有目标需系统覆盖确认；目标在下载期间新建或变化时，再次确认本次覆盖。失败或取消保留原目标，应用只清理本次创建的临时文件；清理失败会显示其位置。符号链接或文件夹不能作为保存目标。
-
-下载及等待提交期间锁定站点、身份和目录，可使用 `⌘.` 取消。取消完成后恢复操作，下载成功须同时满足网络操作和本地提交成功。突然退出可能留下临时文件，确认没有正在执行的下载后，可根据所显示的位置手动清理；应用不扫描删除其他临时文件。
-
-### 批量上传、指标与本机记录
-
-传输菜单“批量上传…”（`⌘⇧B`）可选择多个普通文件。核对清单中原文件名、大小和实际目标后，点击“确认开始批量上传”；预览期间没有网络传输。文件夹、无效文件及编码后重复目标会拒绝。原单文件拖入仍只接受一个普通文件，不自动开始。
-
-队列一次只执行一项，并固定站点、身份、目录与名称。执行前重新验证本地文件；等待文件丢失或变化、失败、取消当前项都会暂停。可明确选择跳过、重试当前项或继续队列；重试是新任务，会重新检查并单独询问覆盖，授权不跨项复用。取消全部会阻止等待项发出请求，等当前后端停止后释放锁定与队列凭据。已成功的文件保留，应用不删除远程文件。
-
-当前任务按单调时钟的最近 5 秒窗口估算速度与剩余时间，每秒最多刷新一次。未知大小、零字节或停顿时显示“估算中”；字节收齐和剩余 0 秒仍需等待协议最终确认，下载还需本地提交完成。
-
-“队列与记录…”（`⌘⇧H`）可展开目标、时间、字节与脱敏错误。最近 100 条终态保存在应用私有 Application Support 的 `FTPUploader/transfer-history.json`，包含文件名、服务器与路径，不保存密码、私钥、含凭据地址或可恢复任务。重启只读取记录，不恢复队列、不自动传输。记录加载或写入失败会单独显示，损坏原数据保留，实际传输结果不变。经确认清除记录只清空本机记录，不删除本地/远程文件，不修改站点或钥匙串。
-
-公开源码从本地提交 `d6ef749` 同步，并更新为 `0.2.0` 版本标识，保留代码、测试、构建脚本、依赖许可与使用说明；原 Git 历史和内部验收资料未公开。
+<p align="center"><sub>原生界面，明确授权。让文件传输保持简单。</sub></p>

@@ -1,4 +1,6 @@
 #include "SSHBridge.h"
+#include <openssl/pem.h>
+#include <openssl/evp.h>
 #include <libssh2.h>
 #include <libssh2_sftp.h>
 #include <sys/socket.h>
@@ -148,11 +150,33 @@ SSHResult ssh_probe(const char *host, int port, FTPOptions options, SSHHostCallb
 }
 const char *ssh_result_message(const SSHResult *result) { return result->message; }
 
-static int authenticate(SSHConnection *connection, const char *username, const char *password) {
+static int validate_pem_key(const unsigned char *key, size_t length, const char *phrase) {
+    const char openssh[] = "-----BEGIN OPENSSH PRIVATE KEY-----";
+    if(length >= sizeof(openssh)-1 && !memcmp(key, openssh, sizeof(openssh)-1)) return 0;
+    BIO *bio = BIO_new_mem_buf(key, (int)length);
+    if(!bio) return -1010;
+    EVP_PKEY *parsed = PEM_read_bio_PrivateKey(bio, NULL, NULL, (void *)(phrase ? phrase : ""));
+    BIO_free(bio);
+    if(!parsed) return -1010;
+    int supported = EVP_PKEY_base_id(parsed) == EVP_PKEY_RSA;
+    EVP_PKEY_free(parsed);
+    return supported ? 0 : -1010;
+}
+
+static int authenticate(SSHConnection *connection, const char *username, const char *password, const unsigned char *private_key, size_t private_key_len, const char *passphrase) {
     if (connection->cancel && connection->cancel(connection->context)) return -1000;
+    if(private_key) { int check = validate_pem_key(private_key, private_key_len, passphrase); if(check) return check; }
     int rc; double deadline = ssh_now() + connection->options.response_timeout;
-    while ((rc = libssh2_userauth_password_ex(connection->session, username, (unsigned int)strlen(username), password, (unsigned int)strlen(password), NULL)) == LIBSSH2_ERROR_EAGAIN) {
-        rc = wait_socket(connection, deadline); if (rc) return rc;
+    do {
+        rc = private_key ? libssh2_userauth_publickey_frommemory(connection->session, username, strlen(username), NULL, 0,
+                    (const char *)private_key, private_key_len, passphrase)
+             : libssh2_userauth_password_ex(connection->session, username, (unsigned int)strlen(username), password, (unsigned int)strlen(password), NULL);
+        if(rc != LIBSSH2_ERROR_EAGAIN) break;
+        rc = wait_socket(connection, deadline); if(rc) return rc;
+    } while(1);
+    if(private_key) {
+        if(rc == LIBSSH2_ERROR_FILE || rc == LIBSSH2_ERROR_KEYFILE_AUTH_FAILED) return -1010;
+        if(rc == LIBSSH2_ERROR_AUTHENTICATION_FAILED || rc == LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED) return -1011;
     }
     return rc;
 }
@@ -197,11 +221,31 @@ static SSHResult finish_sftp(SSHConnection *connection, LIBSSH2_SFTP *sftp, LIBS
     }
     return ssh_result(connection, code, status);
 }
-SSHResult ssh_list(const char *host, int port, const char *path, const char *username, const char *password, FTPOptions options,
+SSHResult ssh_mkdir(const char *host, int port, const char *path, const char *username, const char *password,
+                    const unsigned char *private_key, size_t private_key_len, const char *passphrase, FTPOptions options,
+                    SSHHostCallback hostkey, FTPCancelCallback cancel, void *context) {
+    SSHConnection connection = {.socket = -1, .options = options, .cancel = cancel, .context = context};
+    int code = handshake(&connection, host, port, hostkey);
+    if (!code) code = authenticate(&connection, username, password, private_key, private_key_len, passphrase);
+    if (code) return ssh_result(&connection, code, 0);
+    LIBSSH2_SFTP *sftp = open_sftp(&connection, &code);
+    if (!sftp) return ssh_result(&connection, code, 0);
+    double deadline = ssh_now() + options.response_timeout;
+    for (;;) {
+        if (cancel && cancel(context)) { code = -1000; break; }
+        code = libssh2_sftp_mkdir_ex(sftp, path, (unsigned int)strlen(path), 0755);
+        if (code != LIBSSH2_ERROR_EAGAIN) break;
+        code = wait_socket(&connection, deadline);
+        if (code) break;
+    }
+    return finish_sftp(&connection, sftp, NULL, code);
+}
+
+SSHResult ssh_list(const char *host, int port, const char *path, const char *username, const char *password, const unsigned char *private_key, size_t private_key_len, const char *passphrase, FTPOptions options,
                    SSHHostCallback hostkey, SSHEntryCallback entry, FTPCancelCallback cancel, void *context) {
     SSHConnection connection = {.socket = -1, .options = options, .cancel = cancel, .context = context};
     int code = handshake(&connection, host, port, hostkey);
-    if (!code) code = authenticate(&connection, username, password);
+    if (!code) code = authenticate(&connection, username, password, private_key, private_key_len, passphrase);
     if (code) return ssh_result(&connection, code, 0);
     LIBSSH2_SFTP *sftp = open_sftp(&connection, &code);
     if (!sftp) return ssh_result(&connection, code, 0);
@@ -218,23 +262,43 @@ SSHResult ssh_list(const char *host, int port, const char *path, const char *use
         if (!count) break;
         deadline = ssh_now() + options.stall_timeout;
         if ((count == 1 && name[0] == '.') || (count == 2 && !memcmp(name, "..", 2))) continue;
-        if (!(attributes.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS)) { code = -1004; break; }
-        int directory = LIBSSH2_SFTP_S_ISDIR(attributes.permissions);
+        int kind = SSH_ENTRY_UNKNOWN;
+        if (attributes.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) {
+            unsigned long type = attributes.permissions & LIBSSH2_SFTP_S_IFMT;
+            if (type == LIBSSH2_SFTP_S_IFREG) kind = SSH_ENTRY_FILE;
+            else if (type == LIBSSH2_SFTP_S_IFDIR) kind = SSH_ENTRY_DIRECTORY;
+            else if (type == LIBSSH2_SFTP_S_IFLNK) kind = SSH_ENTRY_LINK;
+            else if (type == LIBSSH2_SFTP_S_IFCHR || type == LIBSSH2_SFTP_S_IFBLK ||
+                     type == LIBSSH2_SFTP_S_IFIFO || type == LIBSSH2_SFTP_S_IFSOCK) kind = SSH_ENTRY_OTHER;
+        }
         int64_t size = attributes.flags & LIBSSH2_SFTP_ATTR_SIZE && attributes.filesize <= INT64_MAX ? (int64_t)attributes.filesize : -1;
-        if (!entry || !entry((const unsigned char *)name, (size_t)count, directory, size, context)) { code = -1004; break; }
+        if (!entry || !entry((const unsigned char *)name, (size_t)count, kind, size, context)) { code = -1004; break; }
     }
     if (!code) { code = close_handle(&connection, &handle); }
     return finish_sftp(&connection, sftp, handle, code);
 }
-SSHResult ssh_upload(const char *host, int port, const char *path, const char *file, const char *username, const char *password, FTPOptions options,
+SSHResult ssh_upload(const char *host, int port, const char *path, const char *file, const char *username, const char *password, const unsigned char *private_key, size_t private_key_len, const char *passphrase, FTPOptions options,
                      SSHHostCallback hostkey, FTPProgressCallback progress, FTPCancelCallback cancel, void *context) {
+    int fd = open(file, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) { SSHResult error = {.code = -1005}; return error; }
+    SSHResult result = ssh_upload_fd(host, port, path, fd, username, password, private_key, private_key_len,
+                                     passphrase, options, hostkey, progress, cancel, context);
+    close(fd);
+    return result;
+}
+
+SSHResult ssh_upload_fd(const char *host, int port, const char *path, int file_fd, const char *username, const char *password,
+                        const unsigned char *private_key, size_t private_key_len, const char *passphrase, FTPOptions options,
+                        SSHHostCallback hostkey, FTPProgressCallback progress, FTPCancelCallback cancel, void *context) {
     SSHConnection connection = {.socket = -1, .options = options, .cancel = cancel, .context = context};
-    FILE *input = fopen(file, "rb"); struct stat attributes;
-    if (!input || fstat(fileno(input), &attributes) || !S_ISREG(attributes.st_mode)) {
+    int owned_fd = fcntl(file_fd, F_DUPFD_CLOEXEC, 0);
+    FILE *input = owned_fd >= 0 ? fdopen(owned_fd, "rb") : NULL; struct stat attributes;
+    if (!input && owned_fd >= 0) close(owned_fd);
+    if (!input || fstat(fileno(input), &attributes) || !S_ISREG(attributes.st_mode) || fseeko(input, 0, SEEK_SET)) {
         if (input) fclose(input); return ssh_result(&connection, -1005, 0);
     }
     int code = handshake(&connection, host, port, hostkey);
-    if (!code) code = authenticate(&connection, username, password);
+    if (!code) code = authenticate(&connection, username, password, private_key, private_key_len, passphrase);
     if (code) { fclose(input); return ssh_result(&connection, code, 0); }
     LIBSSH2_SFTP *sftp = open_sftp(&connection, &code);
     if (!sftp) { fclose(input); return ssh_result(&connection, code, 0); }
@@ -268,11 +332,11 @@ SSHResult ssh_upload(const char *host, int port, const char *path, const char *f
 
 int ssh_available(void) { pthread_once(&ssh_once, initialize_ssh); return !ssh_initialization && libssh2_version(0x010B01) != NULL; }
 
-SSHResult ssh_download(const char *host, int port, const char *path, const char *username, const char *password, FTPOptions options,
+SSHResult ssh_download(const char *host, int port, const char *path, const char *username, const char *password, const unsigned char *private_key, size_t private_key_len, const char *passphrase, FTPOptions options,
                        SSHHostCallback hostkey, FTPDataCallback data, FTPProgressCallback progress, FTPCancelCallback cancel, void *context) {
     SSHConnection connection = {.socket = -1, .options = options, .cancel = cancel, .context = context};
     int code = handshake(&connection, host, port, hostkey);
-    if (!code) code = authenticate(&connection, username, password);
+    if (!code) code = authenticate(&connection, username, password, private_key, private_key_len, passphrase);
     if (code) return ssh_result(&connection, code, 0);
     LIBSSH2_SFTP *sftp = open_sftp(&connection, &code);
     if (!sftp) return ssh_result(&connection, code, 0);
