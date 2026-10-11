@@ -1,6 +1,6 @@
 # v0.3.0 发行候选与剩余门槛
 
-本页不代表已发布。新版源码已进入 GitHub main；本次只准备本地候选，旧 v0.2.0 安装包保持不变。
+用户已确认采用不做 Developer ID 签名或 Apple 公证的 v0.3.0 预发布方案。新版工作台源码已进入 GitHub main，版本与发行配置位于本发行分支；旧 v0.2.0 安装包保持不变。预发布不代表以下缺失验证通过。
 
 ## 当前状态
 
@@ -33,7 +33,7 @@ bash script/prepare_release_candidate.sh
 
 产物在 `dist/release-candidate/`，包含通用 ZIP、SHA256SUMS、签名／链接／构建审计日志及解压检查副本。脚本拒绝覆盖已有输出，不下载证书、不公证、不上传、不创建标签或 Release。ZIP 名称明确标为 `local-candidate`；不要将整个输出目录作为 GitHub 附件上传，原始日志可能包含本机路径。
 
-## Developer ID Application 准备
+## 可选后续：Developer ID Application 准备
 
 由开发者账户持有人在 Apple 开发者账户操作，不在聊天、仓库或脚本中提供秘密：
 
@@ -50,7 +50,7 @@ security find-identity -v -p codesigning
 
 官方步骤：[Create Developer ID certificates](https://developer.apple.com/help/account/certificates/create-developer-id-certificates/)。
 
-## 公证凭据：由用户在本机安全保存
+## 可选后续：公证凭据由用户在本机安全保存
 
 在 Apple Account 页面创建 App-specific password。密码不放在命令参数、不写入环境文件或聊天。以下命令让 notarytool 交互询问并存到钥匙串；账户与 TEAM_ID 使用 Developer ID 对应的有效团队：
 
@@ -69,6 +69,8 @@ xcrun notarytool store-credentials "FTPUploader-notary" \
 
 票据装订到 app 后重新打包并重算 SHA256，对最终解压包验证签名、票据、双架构及版本。隔离下载首启须使用最终包，不能先去掉 quarantine 或改系统安全设置来冒充通过。正式发行前还需实际 macOS 15／Intel 环境证据。
 
-## 目前的阻塞
+## 预发布限制与未完成验证
 
-本机只有 Apple Development／Apple Distribution 身份，没有 Developer ID Application。工具 notarytool 与 stapler 已安装，但没有取得可用公证 profile。当前没有 macOS 15／Intel 验收设备。这些门槛不能用编译、Rosetta、ad-hoc 或修改系统偏好替代；保持未完成，不公开声称“已全部补齐”。
+本预发布按用户确认使用 ad-hoc 本地签名，不申请或使用 Developer ID，也不提交 Apple 公证。GitHub 预发布允许上传此类包，但首次打开可能被 macOS 拦截，不能宣称“已公证”“已受 Apple 信任”或“已全部验证”。
+
+实际 macOS 15／Intel 硬件和最终下载包隔离首启仍未验证。上面的复选框保持未完成，缺失证据不能用编译、Rosetta、ad-hoc 或修改系统偏好替代。证书与公证说明保留为以后选择可信分发时的参考，不是本次预发布已完成事项。
