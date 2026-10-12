@@ -16,6 +16,7 @@ struct ContentView: View {
     @State private var showsSites = true
 
     var body: some View {
+        let displayedDownloadID = model.downloadConfirmationID
         HStack(spacing: 0) {
             if showsSites {
                 SiteIconRail(model: model, sites: model.sites)
@@ -88,9 +89,9 @@ struct ContentView: View {
         .onChange(of: model.downloadState) { _ in announce(downloadStatus) }
         .alert("下载目标已发生变化，覆盖？", isPresented: Binding(
             get: { model.downloadConfirmationID != nil },
-            set: { if !$0 { model.cancelDownloadConfirmation() } }
-        ), presenting: model.downloadConfirmationID) { id in
-            Button("取消", role: .cancel) { model.cancelDownloadConfirmation() }.keyboardShortcut(.defaultAction)
+            set: { if !$0, let id = displayedDownloadID { model.cancelDownloadConfirmation(id) } }
+        ), presenting: displayedDownloadID) { id in
+            Button("取消", role: .cancel) { model.cancelDownloadConfirmation(id) }.keyboardShortcut(.defaultAction)
             Button("仅本次覆盖") { model.confirmDownloadCommit(id) }
         } message: { _ in Text(model.downloadTarget ?? "") }
         .alert("核对 SFTP 服务器指纹", isPresented: Binding(

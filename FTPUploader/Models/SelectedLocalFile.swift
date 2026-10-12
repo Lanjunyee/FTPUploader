@@ -9,7 +9,10 @@ final class SelectedLocalFile {
     private(set) var isAccessActive = false
     var name: String { url.lastPathComponent }
 
-    init(url: URL) throws {
+    private let diagnostics: TransferDiagnostics?
+
+    init(url: URL, diagnostics: TransferDiagnostics? = nil) throws {
+        self.diagnostics = diagnostics
         self.url = url
         try beginAccessAndValidate()
     }
@@ -58,14 +61,14 @@ final class SelectedLocalFile {
     func snapshot(cancellation: FTPCancellationToken = FTPCancellationToken()) async throws -> Snapshot {
         try cancellation.checkCancellation()
         try beginAccessAndValidate()
-        let url = self.url
+        let url = self.url, diagnostics = self.diagnostics
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
                     try cancellation.checkCancellation()
                     let fd = try Self.openFile(url)
                     defer { Darwin.close(fd) }
-                    continuation.resume(returning: try Self.snapshot(descriptor: fd, cancellation: cancellation))
+                    continuation.resume(returning: try Self.snapshot(descriptor: fd, cancellation: cancellation, diagnostics: diagnostics))
                 } catch { continuation.resume(throwing: error) }
             }
         }
@@ -73,9 +76,11 @@ final class SelectedLocalFile {
 
     /// Descriptor belongs to the caller. Never follows a path or loads the whole file.
     static func snapshot(descriptor: Int32, cancellation: FTPCancellationToken,
-                         didRead: ((Int64) -> Void)? = nil) throws -> Snapshot {
+                         didRead: ((Int64) -> Void)? = nil,
+                         diagnostics: TransferDiagnostics? = nil) throws -> Snapshot {
         var before = stat(), after = stat()
         guard fstat(descriptor, &before) == 0, before.st_mode & S_IFMT == S_IFREG else { throw FTPError.localFile("无法读取普通来源文件。") }
+        diagnostics?.record(.hashPasses)
         var hash = SHA256()
         var buffer = [UInt8](repeating: 0, count: 1024 * 1024)
         var total: Int64 = 0
@@ -89,6 +94,7 @@ final class SelectedLocalFile {
             if count == 0 { break }
             total += Int64(count)
             hash.update(data: Data(buffer.prefix(count)))
+            diagnostics?.record(.hashBytes, count: Int64(count))
             didRead?(total)
         }
         try cancellation.checkCancellation()
@@ -106,7 +112,8 @@ final class SelectedLocalFile {
     }
 
     /// Hash and transport share this exact descriptor; no backend reopens its display URL.
-    func verifiedSource(matching expected: Snapshot, cancellation: FTPCancellationToken) async throws -> VerifiedSource {
+    func verifiedSource(matching expected: Snapshot, cancellation: FTPCancellationToken,
+                        didVerifyDescriptor: ((Int32) -> Void)? = nil) async throws -> VerifiedSource {
         let root = try LocalSourceRoot(url: url)
         let source = try VerifiedSource(root: root, expected: expected)
         root.endAccess() // The immutable lease defers actual scope/fd release through transport.
@@ -115,10 +122,11 @@ final class SelectedLocalFile {
                 do {
                     try root.validateIdentity()
                     try source.validateDescriptor()
-                    guard try Self.snapshot(descriptor: source.descriptor, cancellation: cancellation) == expected else {
+                    guard try Self.snapshot(descriptor: source.descriptor, cancellation: cancellation, diagnostics: self.diagnostics) == expected else {
                         throw FTPError.localFile("发送前来源文件发生变化，请重新核对。")
                     }
                     try root.validateIdentity()
+                    didVerifyDescriptor?(source.descriptor)
                     continuation.resume(returning: source)
                 } catch { continuation.resume(throwing: error) }
             }

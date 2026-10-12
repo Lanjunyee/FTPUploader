@@ -30,12 +30,20 @@ protocol HostTrustStoring {
     func verify(_ identity: SSHHostIdentity) throws
     func trust(_ identity: SSHHostIdentity) throws
     func reset(host: String, port: Int) throws
+    func sessionRevision() throws -> UUID?
+}
+
+extension HostTrustStoring {
+    /// A custom store without revision evidence cannot authorize connection reuse.
+    func sessionRevision() throws -> UUID? { nil }
 }
 
 final class HostTrustStore: HostTrustStoring, @unchecked Sendable {
     private struct Record: Codable { let host: String; let port: Int; let key: Data }
     private let url: URL
     private let lock = NSLock()
+    private var revision = UUID()
+    private var revisionSnapshot: Data?
     private let write: (Data, URL) throws -> Void
     init(url: URL? = nil, write: @escaping (Data, URL) throws -> Void = { try $0.write(to: $1, options: .atomic) }) {
         self.url = url ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -52,10 +60,20 @@ final class HostTrustStore: HostTrustStoring, @unchecked Sendable {
         } catch { throw HostTrustError.storage }
     }
     private func save(_ records: [Record]) throws {
+        revision = UUID(); revisionSnapshot = nil
         do {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try write(JSONEncoder().encode(records), url)
         } catch { throw HostTrustError.storage }
+    }
+    func sessionRevision() throws -> UUID? {
+        lock.lock(); defer { lock.unlock() }
+        // Re-read and validate authority, including changes made through another store instance.
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        let snapshot = try encoder.encode(records())
+        if let previous = revisionSnapshot, previous != snapshot { revision = UUID() }
+        revisionSnapshot = snapshot
+        return revision
     }
     func verify(_ identity: SSHHostIdentity) throws {
         lock.lock(); defer { lock.unlock() }

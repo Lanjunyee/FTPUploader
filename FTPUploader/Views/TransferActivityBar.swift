@@ -107,7 +107,7 @@ struct TransferActivitySummary<Controls: View>: View {
                         ProgressView(value: fraction).frame(width: 56)
                             .accessibilityLabel(activity.directionTitle + "内容进度，不代表最终成功")
                     } else if activity.kind != .directory {
-                        Text("已传 " + TransferActivityLayout.bytes(activity.bytes)).font(.callout)
+                        Text(activity.trafficOverflow ? "实际字节未知（计数溢出）" : "已传 " + TransferActivityLayout.bytes(activity.bytes)).font(.callout)
                             .accessibilityLabel("已传内容，总大小未知")
                     }
                 }

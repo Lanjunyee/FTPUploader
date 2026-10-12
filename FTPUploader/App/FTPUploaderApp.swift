@@ -1,14 +1,37 @@
 import SwiftUI
+import AppKit
+
+@MainActor
+final class HistoryApplicationDelegate: NSObject, NSApplicationDelegate {
+    weak var history: TransferHistory?
+    private let termination = HistoryTerminationCoordinator()
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let history else { return .terminateNow }
+        termination.requestExit(history: history, onFailure: { error in
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "传输记录尚未保存"
+            alert.informativeText = error.localizedDescription + "\n传输结果未改变。可取消退出后重试本机保存；仍然退出会丢失待保存记录。"
+            alert.addButton(withTitle: "取消退出")
+            alert.addButton(withTitle: "仍然退出")
+            return alert.runModal() == .alertSecondButtonReturn
+        }, reply: { sender.reply(toApplicationShouldTerminate: $0) })
+        return .terminateLater
+    }
+}
 
 @main
+@MainActor
 struct FTPUploaderApp: App {
     @StateObject private var model = AppModel()
     @StateObject private var bus = TransferCommandBus()
+    @NSApplicationDelegateAdaptor(HistoryApplicationDelegate.self) private var delegate
 
     var body: some Scene {
         Window("FTP 文件传输", id: "main") {
             ContentView(model: model)
                 .environmentObject(bus)
+                .onAppear { delegate.history = model.history }
         }
         .defaultSize(width: Metrics.defaultWindowWidth, height: Metrics.defaultWindowHeight)
         .windowResizability(.contentMinSize)
@@ -16,6 +39,7 @@ struct FTPUploaderApp: App {
 
         Settings {
             SiteManagementView(model: model)
+                .onAppear { delegate.history = model.history }
         }
     }
 }

@@ -15,10 +15,10 @@ struct TransferPanel: View {
                 Text("传输队列与记录").font(.title2)
                 Spacer(); Button("关闭") { dismiss() }.keyboardShortcut(.cancelAction)
             }
-            Text("最近 100 条终态记录仅保存在本机，包含服务器、路径和结果；不保存密码，重启不恢复任务。完整会话结果不受历史上限影响。")
+            Text("最近 100 条终态记录仅保存在本机，包含服务器、路径和结果；不保存密码，重启不恢复任务。完整会话结果不受历史上限影响。正常退出等待已接收记录保存；强制终止可能丢失待保存记录。")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             KeyboardPlanScrollView(active: listFocused, onCancel: { dismiss() }, accessibilityName: "完整传输队列与结果清单") {
-                VStack(alignment: .leading, spacing: 12) {
+                LazyVStack(alignment: .leading, spacing: 12) {
                     if let session = model.sessionSummary {
                         TransferSummaryView(summary: session.original, title: "原计划")
                         Text("累计实际传输（含重试）：" + bytes(session.actualBytes)).font(.caption)
@@ -31,13 +31,17 @@ struct TransferPanel: View {
                         }
                     }
                     Divider(); Text("最近传输记录").font(.headline)
+                    Text(history.persistenceStatus).font(.caption).foregroundStyle(.secondary)
+                    if history.canRetrySave {
+                        Button(history.hasPendingClear ? "重试本机清除／保存" : "重试本机保存") { history.retrySave() }
+                    }
                     if let error = history.error { PlanPathText(text: error).foregroundStyle(.red) }
                     if history.records.isEmpty { Text("暂无记录").foregroundStyle(.secondary) }
                     ForEach(history.records) { record in
                         DisclosureGroup {
                             PlanPathText(text: record.transport.title + " · " + record.server)
                             PlanPathText(text: record.target)
-                            Text("\(record.started.formatted()) → \(record.ended.formatted()) · \(ByteCountFormatter.string(fromByteCount: record.bytes, countStyle: .file))")
+                            Text("\(record.started.formatted()) → \(record.ended.formatted()) · \(record.trafficOverflow == true ? "实际字节未知（计数溢出）" : ByteCountFormatter.string(fromByteCount: record.bytes, countStyle: .file))")
                             if let error = record.error { PlanPathText(text: error) }
                             if let reason = record.blockedReason { Text("依赖原因：" + reason.title) }
                         } label: {
@@ -51,7 +55,7 @@ struct TransferPanel: View {
             HStack {
                 Button("取消全部") { model.cancelAllTransfers() }.disabled(!model.canCancelAllTransfers)
                 Spacer()
-                Button("清除记录…") { clearConfirmation = true }.disabled(history.records.isEmpty)
+                Button("清除记录…") { clearConfirmation = true }.disabled(!history.canClear)
             }.controlSize(.small)
         }
         .padding(16).frame(minWidth: 580, idealWidth: 700, minHeight: 420, idealHeight: 550)
@@ -92,7 +96,7 @@ private struct TransferQueueSection: View {
     let label: String
     private var direction: String { queue.items.first?.direction == .download ? "下载队列" : "上传队列" }
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        Group {
             Text(label + " · " + direction + " · " + phaseTitle).font(.headline)
             if label != "原队列", let summary = queue.summary { TransferSummaryView(summary: summary, title: label) }
             ForEach(queue.items) { item in
@@ -100,11 +104,11 @@ private struct TransferQueueSection: View {
                     PlanPathText(text: item.directionTitle + " · " + item.kindTitle + " · " + item.name + " · " + item.statusTitle)
                     PlanPathText(text: "目标：" + item.target).font(.caption)
                     Text(item.sizeDescription).font(.caption)
-                    if let dependency = item.dependencyDescription(in: queue.items) {
+                    if let dependency = queue.dependencyDescription(for: item) {
                         PlanPathText(text: dependency).font(.caption).foregroundStyle(.secondary)
                     }
                     if item.kind == .regularFile {
-                        Text("本项实际流量：" + bytes(item.actualBytes) + " · 已传：" + bytes(item.bytes)).font(.caption)
+                        Text("本项实际流量：" + bytes(item.trafficOverflow ? nil : item.actualBytes) + " · 已传：" + bytes(item.bytes)).font(.caption)
                         if let total = item.snapshot?.size ?? item.sizeHint, total > 0,
                            item.state == .running || item.state == .awaitingCompletion {
                             ProgressView(value: Double(min(item.bytes, total)), total: Double(total))
@@ -116,7 +120,7 @@ private struct TransferQueueSection: View {
                             .disabled(!model.canPrepareCollectionRetry(itemID: item.id))
                             .accessibilityLabel("重新核对并预览失败项 " + item.name)
                     }
-                }.frame(maxWidth: .infinity, alignment: .leading)
+                }.frame(maxWidth: .infinity, alignment: .leading).id(item.id)
                 Divider()
             }
             if let error = queue.error { PlanPathText(text: "批次提示：" + error).foregroundStyle(.red) }
@@ -142,19 +146,7 @@ private struct TransferQueueSection: View {
         .onAppear { announce() }
         .onChange(of: phaseTitle) { _ in announce() }
     }
-    private var phaseTitle: String {
-        switch queue.state {
-        case .scanning: return "正在核对来源"
-        case .preview: return "待核对"
-        case .running:
-            if queue.items.contains(where: { $0.state == .awaitingOverwrite }) { return "等待本次覆盖确认" }
-            if queue.items.contains(where: { $0.state == .awaitingCompletion }) { return "等待服务器最终确认及下载提交" }
-            return "串行执行"
-        case .paused: return "已暂停，等待明确处理"
-        case .cancelling: return "正在取消，等待资源释放"
-        case .finished: return queue.isLocked ? "等待重试资源释放" : "已结束"
-        }
-    }
+    private var phaseTitle: String { queue.displayPhaseTitle }
     private func announce() {
         var text = label + "，" + direction + "，" + phaseTitle
         if queue.state == .finished, let summary = queue.summary {

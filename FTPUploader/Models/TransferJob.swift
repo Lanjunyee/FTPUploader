@@ -1,5 +1,30 @@
 import Foundation
 
+/// Opt-in measurement boundary. Only fixed event names and numeric totals are retained;
+/// credentials, paths, key bytes and digests cannot enter the counter API.
+final class TransferDiagnostics: @unchecked Sendable {
+    enum Event: String, CaseIterable, Codable {
+        case listings, connections, authentications, hashPasses, hashBytes, notifications
+        case planRootKeys, planNodeMembershipChecks, planIndexNodes
+        case planNodeLookups, planRootLookups, planDirectoryLookups
+        case summarySnapshots, summaryNodes, queueIndexNodes, queueItemLookups, dependencyLookups
+    }
+    private let lock = NSLock()
+    private var totals: [Event: Int64] = [:]
+
+    func record(_ event: Event, count: Int64 = 1) {
+        guard count >= 0 else { return }
+        lock.lock(); defer { lock.unlock() }
+        let sum = (totals[event] ?? 0).addingReportingOverflow(count)
+        totals[event] = sum.overflow ? Int64.max : sum.partialValue
+    }
+
+    var snapshot: [String: Int64] {
+        lock.lock(); defer { lock.unlock() }
+        return Dictionary(uniqueKeysWithValues: Event.allCases.map { ($0.rawValue, totals[$0] ?? 0) })
+    }
+}
+
 enum TransferDirection: String, Codable { case upload, download }
 enum TransferOutcome: Equatable { case succeeded, failed(String), cancelled, skipped(String) }
 
@@ -39,6 +64,7 @@ final class TransferJob: Identifiable {
     let localURL: URL
     let cancellation: FTPCancellationToken
     private(set) var outcome: TransferOutcome?
+    let historyAdmission = TransferHistoryAdmission()
     var uploadSource: SelectedLocalFile.VerifiedSource?
     let byteCounter = TransferByteCounter()
     var completedFileBytes: Int64 = 0
@@ -161,10 +187,13 @@ final class BatchTransferQueue: ObservableObject, Identifiable {
             return state.title
         }
         func dependencyDescription(in items: [Item]) -> String? {
+            dependencyDescription(lookup: { id in items.first { $0.id == id } })
+        }
+        func dependencyDescription(lookup: (UUID) -> Item?) -> String? {
             let dependency: UUID?
             if case .blocked(let id, _) = state { dependency = id } else { dependency = parentID }
             guard let dependency else { return nil }
-            guard let parent = items.first(where: { $0.id == dependency }) else { return "父目录依赖：" + dependency.uuidString }
+            guard let parent = lookup(dependency) else { return "父目录依赖：" + dependency.uuidString }
             return "父目录：" + parent.name + " · " + parent.statusTitle + "\n" + parent.target
         }
         var isEligibleForFailureRetry: Bool {
@@ -181,17 +210,25 @@ final class BatchTransferQueue: ObservableObject, Identifiable {
         let credentials: FTPCredentials
         var direction: TransferDirection = .upload
     }
-    @Published private(set) var items: [Item] = []
-    @Published private(set) var state: State = .finished
+    private var displayRevision: UInt64 = 0
+    private var itemPositions: [UUID: Int] = [:]
+    @Published private(set) var items: [Item] = [] { didSet { displayRevision &+= 1 } }
+    @Published private(set) var state: State = .finished { didSet {
+        displayRevision &+= 1
+        if state == .paused { connection?.pause() }
+    } }
     @Published private(set) var error: String?
     @Published private(set) var overwriteID: UUID? {
         didSet { if overwriteID == nil { overwriteNodeID = nil } }
     }
     @Published private(set) var overwriteNodeID: UUID?
-    var overwriteTarget: String? { items.first { $0.id == overwriteNodeID }?.target }
+    var overwriteTarget: String? { overwriteNodeID.flatMap { item(id: $0)?.target } }
     @Published private(set) var conflictPolicy = TransferConflictPolicy.ask
     private let client: FTPServing
-    private let files: FileTransferRunner
+    private let diagnostics: TransferDiagnostics?
+    private var files: FileTransferRunner
+    private var connection: TransferConnectionOwner?
+    private let connectionScheduler: TransferConnectionOwner.Scheduler
     private let executor: TransferExecutor
     private var collection: CollectionTransferExecution?
     /// Retains only the confirmed list and paths after execution releases authentication/scopes.
@@ -218,7 +255,16 @@ final class BatchTransferQueue: ObservableObject, Identifiable {
     private var decision: CheckedContinuation<Void, Error>?
     private var cancelledAll = false
     private var index = 0
-    private var taskStates: [UUID: TransferTaskState] = [:]
+    private var taskStates: [UUID: TransferTaskState] = [:] { didSet { displayRevision &+= 1 } }
+    private struct SummaryKey: Equatable {
+        let revision: UInt64
+        let finished: Bool
+        let activeID: UUID?
+        let activeBytes: Int64
+        let activeOverflow: Bool
+    }
+    private var summaryKey: SummaryKey?
+    private var summarySnapshot: TransferSummary?
     private var childIndices: [UUID: [Int]] = [:]
     var taskResults: [UUID: TransferTaskResult] {
         taskStates.reduce(into: [:]) { values, pair in
@@ -227,14 +273,22 @@ final class BatchTransferQueue: ObservableObject, Identifiable {
     }
     var summary: TransferSummary? {
         guard !taskStates.isEmpty else { return nil }
-        return TransferSummary(entries: items.filter { taskStates[$0.id] != nil }.map { item in
-            .init(id: item.id, target: item.target, kind: item.kind == .directory ? .directory : .file,
+        let counterBytes = active?.byteCounter.bytes ?? 0, counterOverflow = active?.byteCounter.hasOverflow ?? false
+        let key = SummaryKey(revision: displayRevision, finished: state == .finished && !isLocked,
+            activeID: active?.id, activeBytes: counterBytes, activeOverflow: counterOverflow)
+        if summaryKey == key { return summarySnapshot }
+        let activeItemID = active != nil && items.indices.contains(index) ? items[index].id : nil
+        let projected = items.lazy.compactMap { [self] item -> TransferSummary.Entry? in
+            guard taskStates[item.id] != nil else { return nil }
+            return .init(id: item.id, target: item.target, kind: item.kind == .directory ? .directory : .file,
                   direction: item.direction, result: item.state.terminalResult, size: item.snapshot?.size ?? item.sizeHint,
                   successfulBytes: item.successfulBytes,
-                  actualBytes: active != nil && items.indices.contains(index) && items[index].id == item.id
-                    ? max(item.actualBytes, active?.byteCounter.bytes ?? 0) : item.actualBytes,
-                  trafficOverflow: item.trafficOverflow)
-        }, isFinished: state == .finished && !isLocked)
+                  actualBytes: item.id == activeItemID ? max(item.actualBytes, counterBytes) : item.actualBytes,
+                  trafficOverflow: item.trafficOverflow || (item.id == activeItemID && counterOverflow))
+        }
+        let snapshot = TransferSummary(projecting: projected, isFinished: key.finished, diagnostics: diagnostics)
+        summaryKey = key; summarySnapshot = snapshot
+        return snapshot
     }
     var onResult: ((UUID, TransferTaskResult) -> Void)?
     var onHistoryRecord: ((TransferRecord) -> Void)?
@@ -269,8 +323,46 @@ final class BatchTransferQueue: ObservableObject, Identifiable {
     var onStart: ((Int64) -> Void)?
     private var actualBytes: Int64 = 0
 
-    init(client: FTPServing, executor: TransferExecutor) {
-        self.client = client; self.executor = executor; files = FileTransferRunner(client: client, executor: executor)
+    init(client: FTPServing, executor: TransferExecutor, diagnostics: TransferDiagnostics? = nil,
+         connectionScheduler: @escaping TransferConnectionOwner.Scheduler = TransferConnectionOwner.scheduleIdle) {
+        self.client = client; self.executor = executor; self.diagnostics = diagnostics; self.connectionScheduler = connectionScheduler
+        files = FileTransferRunner(client: client, executor: executor)
+    }
+
+    private func replaceItems(_ replacement: [Item]) {
+        summaryKey = nil; summarySnapshot = nil
+        itemPositions = Dictionary(replacement.enumerated().map { ($0.element.id, $0.offset) }, uniquingKeysWith: { first, _ in first })
+        diagnostics?.record(.queueIndexNodes, count: Int64(replacement.count))
+        items = replacement
+    }
+    private func insertItem(_ item: Item, at position: Int) {
+        items.insert(item, at: position)
+        for index in position..<items.count { itemPositions[items[index].id] = index }
+        diagnostics?.record(.queueIndexNodes, count: Int64(items.count - position))
+    }
+    func item(id: UUID) -> Item? {
+        diagnostics?.record(.queueItemLookups)
+        guard let position = itemPositions[id], items.indices.contains(position) else { return nil }
+        return items[position]
+    }
+    func dependencyDescription(for item: Item) -> String? {
+        diagnostics?.record(.dependencyLookups)
+        return item.dependencyDescription(lookup: { self.item(id: $0) })
+    }
+    var displayPhaseTitle: String {
+        switch state {
+        case .scanning: return "正在核对来源"
+        case .preview: return "待核对"
+        case .running:
+            if items.indices.contains(index) {
+                if items[index].state == .awaitingOverwrite { return "等待本次覆盖确认" }
+                if items[index].state == .awaitingCompletion { return "等待服务器最终确认及下载提交" }
+            }
+            return "串行执行"
+        case .paused: return "已暂停，等待明确处理"
+        case .cancelling: return "正在取消，等待资源释放"
+        case .finished: return isLocked ? "等待重试资源释放" : "已结束"
+        }
     }
 
     func prepare(_ urls: [URL], endpoint: FTPEndpoint, path: RemotePath, encoding: FTPTextEncoding, credentials: FTPCredentials) throws {
@@ -286,7 +378,10 @@ final class BatchTransferQueue: ObservableObject, Identifiable {
         let token = FTPCancellationToken()
         preparationCancellation = token
         retainedPlan = nil; retainedEndpoint = nil; retainedRemoteRoot = nil; retainedEncoding = nil; retainedDestinationURL = nil
-        items = []; context = Context(endpoint: endpoint, path: path, encoding: encoding, credentials: credentials)
+        connection?.close()
+        let owner = TransferConnectionOwner(base: client, endpoint: endpoint, credentials: credentials, executor: executor, schedule: connectionScheduler)
+        connection = owner; self.files = FileTransferRunner(client: owner, executor: executor)
+        replaceItems([]); context = Context(endpoint: endpoint, path: path, encoding: encoding, credentials: credentials)
         index = 0; cancelledAll = false; error = nil; taskStates = [:]; childIndices = [:]; state = .scanning
         Task {
             defer { files.forEach { $0.endAccess() }; preparationCancellation = nil }
@@ -300,7 +395,7 @@ final class BatchTransferQueue: ObservableObject, Identifiable {
                         snapshot: snapshot))
                 }
                 guard preparationCancellation === token, !cancelledAll else { throw CancellationError() }
-                items = prepared; state = .preview
+                replaceItems(prepared); state = .preview
             } catch {
                 if !(error is CancellationError) { self.error = credentials.redacting(error.localizedDescription) }
                 files.forEach { $0.endAccess() }
@@ -316,8 +411,9 @@ final class BatchTransferQueue: ObservableObject, Identifiable {
                  destination: LocalDestinationRoot? = nil) throws {
         guard !isLocked else { throw FTPError.localFile("请先结束当前批次。") }
         guard Set(plan.nodes.map(\.id)).count == plan.nodes.count else { throw FTPError.localFile("计划节点 id 重复。") }
+        let owner = TransferConnectionOwner(base: client, endpoint: endpoint, credentials: credentials, executor: executor, schedule: connectionScheduler)
         let execution = try CollectionTransferExecution(plan: plan, endpoint: endpoint, remoteRoot: remoteRoot,
-            credentials: credentials, client: client, executor: executor, sources: sources, destination: destination)
+            credentials: credentials, client: owner, executor: executor, sources: sources, destination: destination)
         let prepared = try plan.nodes.map { node -> Item in
             let job = try execution.job(for: node)
             let snapshot: SelectedLocalFile.Snapshot?
@@ -331,9 +427,10 @@ final class BatchTransferQueue: ObservableObject, Identifiable {
         }
         retainedPlan = plan; retainedEndpoint = endpoint; retainedRemoteRoot = remoteRoot
         retainedEncoding = encoding; retainedDestinationURL = destination?.url
+        connection?.close(); connection = owner
         collection = execution; conflictPolicy = .ask
         context = Context(endpoint: endpoint, path: remoteRoot, encoding: encoding, credentials: credentials, direction: plan.direction)
-        items = prepared; index = 0; cancelledAll = false; error = nil; taskStates = [:]; childIndices = [:]
+        replaceItems(prepared); index = 0; cancelledAll = false; error = nil; taskStates = [:]; childIndices = [:]
         for (i, item) in items.enumerated() {
             if let parent = item.parentID { childIndices[parent, default: []].append(i) }
         }
@@ -353,6 +450,7 @@ final class BatchTransferQueue: ObservableObject, Identifiable {
         for item in items where taskStates[item.id] == nil {
             taskStates[item.id] = TransferTaskState(id: item.id, kind: item.kind == .directory ? .directory : .file)
         }
+        connection?.resume()
         state = .running
         Task { await run() }
     }
@@ -369,40 +467,40 @@ final class BatchTransferQueue: ObservableObject, Identifiable {
             active = job; items[current].started = job.started; items[current].state = .running; actualBytes = 0
             onStart?(snapshot.size)
             var file: SelectedLocalFile?
+            let progressGeneration = job.id, expectedBytes = snapshot.size
+            let progressBox = makeProgressMailbox(job: job, index: current, itemID: item.id)
+            defer { progressBox.stop() }
             do {
                 try await files.run(job, preparing: {
                     let selected = try SelectedLocalFile(url: item.url); file = selected
                     guard try await selected.snapshot(cancellation: job.cancellation) == snapshot else {
                         throw FTPError.localFile("等待期间文件已变化，请明确重试以重新核对：" + item.name)
                     }
-                    let existing = try await client.checkUploadTarget(endpoint: job.endpoint, path: job.path, name: item.name,
+                    let existing = try await ((connection as FTPServing?) ?? client).checkUploadTarget(endpoint: job.endpoint, path: job.path, name: item.name,
                                                                      encoding: job.encoding, credentials: job.credentials, cancellation: job.cancellation)
                     try job.cancellation.checkCancellation()
                     if let existing {
                         guard existing.kind == .regularFile else { throw FTPError.uploadTargetConflict }
                         items[current].state = .awaitingOverwrite; overwriteNodeID = item.id; overwriteID = UUID()
+                        connection?.pause()
                         try await withCheckedThrowingContinuation { decision = $0 }
                         try job.cancellation.checkCancellation()
                         guard try await selected.snapshot(cancellation: job.cancellation) == snapshot else { throw FTPError.localFile("覆盖授权后文件发生变化，请重新核对。") }
                     }
                     job.uploadSource = try await selected.verifiedSource(matching: snapshot, cancellation: job.cancellation)
                     items[current].state = .running
-                }, progress: { [weak self] bytes, total in
-                        Task { @MainActor [weak self] in
-                            guard let self, self.active === job, !job.cancellation.isCancelled,
-                                  [.running, .awaitingCompletion].contains(self.items[current].state) else { return }
-                            self.actualBytes = max(self.actualBytes, bytes)
-                            if self.onProgress?(item.id, bytes, total) ?? true { self.items[current].bytes = self.actualBytes }
-                            let next: ItemState = total >= 0 && bytes >= total ? .awaitingCompletion : .running
-                            if self.items[current].state != next { self.items[current].state = next }
-                        }
+                }, progress: { bytes, _ in
+                    progressBox.submit(bytes: bytes, total: expectedBytes, generation: progressGeneration)
+                    if bytes >= expectedBytes { progressBox.signalContentSent() }
                 })
                 items[current].bytes = job.completedFileBytes; items[current].successfulBytes = job.completedFileBytes
                 setTerminal(current, .succeeded)
             } catch {
+                if !(error is TransferSkipped) { connection?.stopAfterFailure() }
                 setTerminal(current, job.cancellation.isCancelled || error is CancellationError ? .cancelled : (error is TransferSkipped ? .skipped : .failed(job.credentials.redacting(error.localizedDescription))))
             }
-            items[current].actualBytes = job.byteCounter.bytes; items[current].trafficOverflow = job.byteCounter.hasOverflow
+            actualBytes = job.byteCounter.bytes
+            items[current].actualBytes = actualBytes; items[current].trafficOverflow = job.byteCounter.hasOverflow
             file?.endAccess(); active = nil; overwriteID = nil; decision = nil
             onFinish?(job, item.target, max(actualBytes, items[current].bytes))
             if cancelledAll { finishBatch(); return }
@@ -410,6 +508,19 @@ final class BatchTransferQueue: ObservableObject, Identifiable {
             index += 1
         }
         finishBatch()
+    }
+
+    private func makeProgressMailbox(job: TransferJob, index: Int, itemID: UUID) -> TransferProgressMailbox {
+        TransferProgressMailbox(generation: job.id, contentSent: { [weak self, weak job] in
+            guard let self, let job, self.active === job, job.outcome == nil, !job.cancellation.isCancelled,
+                  self.items.indices.contains(index), [.running, .awaitingCompletion].contains(self.items[index].state) else { return }
+            self.items[index].state = .awaitingCompletion
+        }, deliver: { [weak self, weak job] sample in
+            guard let self, let job, self.active === job, job.outcome == nil, !job.cancellation.isCancelled,
+                  self.items.indices.contains(index), [.running, .awaitingCompletion].contains(self.items[index].state) else { return }
+            self.actualBytes = max(self.actualBytes, sample.bytes)
+            if self.onProgress?(itemID, sample.bytes, sample.total) ?? true { self.items[index].bytes = self.actualBytes }
+        })
     }
 
     private func runCollection() async {
@@ -420,42 +531,45 @@ final class BatchTransferQueue: ObservableObject, Identifiable {
             default: break
             }
             guard items[current].state == .waiting else { state = .paused; return }
-            if let parent = node.parentID, items.first(where: { $0.id == parent })?.state != .succeeded {
+            if let parent = node.parentID, execution.plan.index.positionByID[parent].map { items[$0].state } != .succeeded {
                 error = "父目录未成功，不能执行子项。"; state = .paused; return
             }
             let job: TransferJob
             do { job = try execution.job(for: node) }
             catch { self.error = context.credentials.redacting(error.localizedDescription); state = .paused; return }
             active = job; items[current].started = job.started; items[current].state = .running; actualBytes = 0; onStart?(node.size ?? -1)
+            let progressGeneration = job.id, expectedBytes = node.size ?? -1, isUpload = job.direction == .upload
+            let progressBox = makeProgressMailbox(job: job, index: current, itemID: node.id)
+            defer { progressBox.stop() }
             do {
                 items[current].reusedDirectory = try await execution.execute(node, job: job, decide: {
                     try job.cancellation.checkCancellation()
                     items[current].state = .awaitingOverwrite; overwriteNodeID = node.id; overwriteID = UUID()
+                    connection?.pause()
                     try await withCheckedThrowingContinuation { decision = $0 }
                     try job.cancellation.checkCancellation()
                     items[current].state = .running
                 }, cleanupFailure: { warning in
                     self.error = context.credentials.redacting(warning.localizedDescription)
-                }, progress: { [weak self] bytes, total in
-                    Task { @MainActor [weak self] in
-                        guard let self, self.active === job, !job.cancellation.isCancelled,
-                              [.running, .awaitingCompletion].contains(self.items[current].state) else { return }
-                        self.actualBytes = max(self.actualBytes, bytes)
-                        if self.onProgress?(node.id, bytes, total) ?? true { self.items[current].bytes = self.actualBytes }
-                        self.items[current].state = total >= 0 && bytes >= total ? .awaitingCompletion : .running
-                    }
+                }, progress: { bytes, total in
+                    progressBox.submit(bytes: bytes, total: isUpload ? expectedBytes : total, generation: progressGeneration)
+                    let complete = isUpload ? expectedBytes >= 0 && bytes >= expectedBytes
+                        : (total > 0 || (total == 0 && expectedBytes == 0)) && bytes >= total
+                    if complete { progressBox.signalContentSent() }
                 })
                 items[current].bytes = node.kind == .directory ? 0 : job.completedFileBytes
                 items[current].successfulBytes = items[current].bytes
                 setTerminal(current, .succeeded)
             } catch {
+                if !(error is TransferSkipped) { connection?.stopAfterFailure() }
                 let cancelled = job.cancellation.isCancelled || error is CancellationError
                 let message = context.credentials.redacting(error.localizedDescription)
                 let skipped = error is TransferSkipped
                 job.finish(cancelled ? .cancelled : (skipped ? .skipped("用户明确跳过同名文件") : .failed(message)))
                 setTerminal(current, cancelled ? .cancelled : (skipped ? .skipped : .failed(message)))
             }
-            items[current].actualBytes = node.kind == .directory ? 0 : job.byteCounter.bytes
+            actualBytes = node.kind == .directory ? 0 : job.byteCounter.bytes
+            items[current].actualBytes = actualBytes
             items[current].trafficOverflow = job.byteCounter.hasOverflow
             active = nil; overwriteID = nil; decision = nil
             onFinish?(job, items[current].target, items[current].actualBytes)
@@ -468,6 +582,7 @@ final class BatchTransferQueue: ObservableObject, Identifiable {
 
     func confirmOverwrite(_ id: UUID) {
         guard overwriteID == id, let continuation = decision else { return }
+        connection?.resume()
         decision = nil; overwriteID = nil; continuation.resume()
     }
     func cancelOverwrite(_ id: UUID) {
@@ -476,12 +591,13 @@ final class BatchTransferQueue: ObservableObject, Identifiable {
     }
     func skipOverwrite(_ id: UUID) {
         guard overwriteID == id, let continuation = decision else { return }
+        connection?.resume()
         decision = nil; overwriteID = nil; continuation.resume(throwing: TransferSkipped.requested)
     }
     func cancelCurrent() {
         if preparationCancellation != nil { cancelAll(); return }
         guard let active else { return }
-        active.cancellation.cancel()
+        active.cancellation.cancel(); connection?.stopAfterFailure()
         if let decision { self.decision = nil; overwriteID = nil; decision.resume(throwing: CancellationError()) }
     }
     @discardableResult
@@ -493,14 +609,15 @@ final class BatchTransferQueue: ObservableObject, Identifiable {
             items[i].trafficOverflow = active.byteCounter.hasOverflow
         }
         items[i].state = state
-        if taskStates[items[i].id] != nil {
+        if let task = taskStates[items[i].id] {
             onResult?(items[i].id, result)
             if let collection, let context {
                 let item = items[i]
                 onHistoryRecord?(.task(id: item.id, direction: item.direction,
                     kind: item.kind == .directory ? .directory : .file, name: item.name,
                     endpoint: context.endpoint, target: item.target, credentials: context.credentials,
-                    result: result, started: item.started ?? Date(), bytes: item.actualBytes, batchID: collection.plan.id))
+                    result: result, started: item.started ?? Date(), bytes: item.actualBytes, batchID: collection.plan.id,
+                    admission: task.historyAdmission, trafficOverflow: item.trafficOverflow))
             }
         }
         return true
@@ -573,7 +690,6 @@ final class BatchTransferQueue: ObservableObject, Identifiable {
         if state == .paused {
             for id in failures { blockDescendants(of: id, reason: .failedAncestor) }
         }
-        let byID = Dictionary(uniqueKeysWithValues: plan.nodes.map { ($0.id, $0) })
         let states = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0.state) })
         var included = Set(failures)
         // Include only failure-blocked paths rooted in the selected failure(s).
@@ -582,18 +698,19 @@ final class BatchTransferQueue: ObservableObject, Identifiable {
             var parent = node.parentID
             while let id = parent {
                 if included.contains(id) { included.insert(node.id); break }
-                parent = byID[id]?.parentID
+                parent = plan.index.node(id: id)?.parentID
             }
         }
         for id in Array(included) {
-            var parent = byID[id]?.parentID
+            var parent = plan.index.node(id: id)?.parentID
             while let ancestor = parent {
-                guard let node = byID[ancestor], node.kind == .directory else { return nil }
+                guard let node = plan.index.node(id: ancestor), node.kind == .directory else { return nil }
                 included.insert(ancestor); parent = node.parentID
             }
         }
         let nodes = plan.nodes.filter { included.contains($0.id) }
-        let roots = plan.roots.filter { root in nodes.contains { $0.rootID == root.id } }
+        let rootIDs = Set(nodes.map(\.rootID))
+        let roots = plan.roots.filter { rootIDs.contains($0.id) }
         let subset = TransferPlan(direction: plan.direction, roots: roots, nodes: nodes)
         guard subset.canStart else { return nil }
         let request = RetryRequest(plan: subset, endpoint: endpoint, remoteRoot: remoteRoot, encoding: encoding,
@@ -643,7 +760,7 @@ final class BatchTransferQueue: ObservableObject, Identifiable {
                 let snapshot = try await selected.snapshot(cancellation: token)
                 try token.checkCancellation()
                 let retry = Item(id: UUID(), url: original.url, name: original.name, target: original.target, snapshot: snapshot)
-                items.insert(retry, at: index + 1); index += 1; error = nil
+                insertItem(retry, at: index + 1); index += 1; error = nil
                 preparationCancellation = nil; state = .paused
                 startOrContinue()
             } catch {
@@ -672,6 +789,8 @@ final class BatchTransferQueue: ObservableObject, Identifiable {
         else { finishBatch() }
     }
     private func finishBatch() {
+        connection?.close(); connection = nil
+        files = FileTransferRunner(client: client, executor: executor)
         collection?.release(); collection = nil; context = nil
         state = .finished; overwriteID = nil; decision = nil
         onEnd?()
@@ -679,6 +798,108 @@ final class BatchTransferQueue: ObservableObject, Identifiable {
 }
 
 /// Uses a monotonic clock. A sample outside the window is retained only to interpolate its boundary.
+/// One cancellable display delivery per fixed attempt. Backend byte counters remain
+/// separate and must sample every callback; control/terminal events never wait here.
+final class TransferProgressMailbox: @unchecked Sendable {
+    struct Sample: Equatable, Sendable { let generation: UUID; let bytes: Int64; let total: Int64 }
+    typealias Scheduler = (Double, @escaping () -> Void) -> DispatchWorkItem
+    private let lock = NSLock()
+    private let generation: UUID
+    private let clock: () -> Double
+    private let schedule: Scheduler
+    private let deliver: @MainActor (Sample) -> Void
+    private let contentSent: (@MainActor () -> Void)?
+    private var contentSentQueued = false
+    private var active = true, pending = false, dirty = false
+    private var latest: Sample?
+    private var lastEmission = -Double.infinity
+    private var observedTime = -Double.infinity
+    private var ticket: UInt64 = 0
+    private var scheduled: DispatchWorkItem?
+    var pendingNotificationCount: Int { lock.lock(); defer { lock.unlock() }; return pending ? 1 : 0 }
+
+    init(generation: UUID, clock: @escaping () -> Double = { ProcessInfo.processInfo.systemUptime },
+         schedule: @escaping Scheduler = { delay, work in
+             let item = DispatchWorkItem(block: work)
+             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+             return item
+         }, contentSent: (@MainActor () -> Void)? = nil, deliver: @escaping @MainActor (Sample) -> Void) {
+        self.generation = generation; self.clock = clock; self.schedule = schedule; self.deliver = deliver
+        self.contentSent = contentSent
+    }
+    func submit(bytes: Int64, total: Int64, generation: UUID) {
+        lock.lock()
+        guard active, generation == self.generation, bytes >= 0,
+              bytes >= (latest?.bytes ?? 0) else { lock.unlock(); return }
+        let now = clock()
+        guard now.isFinite else { lock.unlock(); return }
+        observedTime = max(observedTime, now)
+        let sample = Sample(generation: generation, bytes: bytes, total: total < 0 ? -1 : max(bytes, total))
+        guard sample != latest else { lock.unlock(); return }
+        latest = sample; dirty = true
+        guard !pending else { lock.unlock(); return }
+        pending = true; ticket &+= 1
+        let nextTicket = ticket, delay = max(0, lastEmission + 1 - observedTime)
+        lock.unlock()
+        enqueue(ticket: nextTicket, delay: delay)
+    }
+    private func enqueue(ticket: UInt64, delay: Double) {
+        let item = schedule(delay) { [weak self] in
+            Task { @MainActor [weak self] in self?.flush(ticket: ticket) }
+        }
+        lock.lock()
+        if active, pending, self.ticket == ticket { scheduled = item; lock.unlock() }
+        else { lock.unlock(); item.cancel() }
+    }
+    @MainActor private func flush(ticket: UInt64) {
+        lock.lock()
+        guard active, pending, self.ticket == ticket, let sample = latest else { lock.unlock(); return }
+        let now = clock()
+        guard now.isFinite else { pending = false; dirty = false; scheduled = nil; lock.unlock(); return }
+        observedTime = max(observedTime, now)
+        let delay = max(0, lastEmission + 1 - observedTime)
+        scheduled = nil
+        if delay > 0 {
+            self.ticket &+= 1
+            let nextTicket = self.ticket
+            lock.unlock(); enqueue(ticket: nextTicket, delay: delay); return
+        }
+        dirty = false; lastEmission = observedTime
+        lock.unlock()
+        deliver(sample)
+        // Submissions during delivery may update the latest sample, but cannot enqueue
+        // another callback until this delivery returns and the next display slot is due.
+        lock.lock()
+        guard active, self.ticket == ticket else { lock.unlock(); return }
+        pending = false
+        if dirty {
+            pending = true; self.ticket &+= 1
+            let nextTicket = self.ticket, delay = max(0, lastEmission + 1 - observedTime)
+            lock.unlock(); enqueue(ticket: nextTicket, delay: delay)
+        } else { lock.unlock() }
+    }
+    /// A once-only phase hint uses an independent immediate control event, not the display slot.
+    func signalContentSent() {
+        lock.lock()
+        guard active, !contentSentQueued, contentSent != nil else { lock.unlock(); return }
+        contentSentQueued = true; lock.unlock()
+        Task { @MainActor [weak self] in self?.publishContentSent() }
+    }
+    @MainActor private func publishContentSent() {
+        lock.lock(); let allowed = active && contentSentQueued; lock.unlock()
+        if allowed { contentSent?() }
+    }
+    @discardableResult func stop() -> Sample? {
+        lock.lock()
+        let finalSample = latest
+        active = false; pending = false; dirty = false; latest = nil; ticket &+= 1
+        let item = scheduled; scheduled = nil
+        lock.unlock(); item?.cancel()
+        return finalSample
+    }
+    deinit { scheduled?.cancel() }
+}
+
 struct TransferMetrics {
     struct Estimate: Equatable { let bytes: Int64; let total: Int64?; let speed: Double?; let remaining: Double? }
     private var samples: [(Double, Int64)] = []
@@ -734,14 +955,20 @@ final class TransferMetricsMonitor: ObservableObject {
         }
     }
     @discardableResult
-    func update(bytes: Int64, total: Int64) -> Bool {
+    func update(bytes: Int64, total: Int64, force: Bool = false) -> Bool {
         metrics.sample(bytes: bytes, total: total, at: clock())
-        return emit()
+        return emit(force: force)
+    }
+    func finish(bytes: Int64, total: Int64) {
+        _ = update(bytes: bytes, total: total, force: true)
+        stop()
     }
     @discardableResult
-    func emit() -> Bool {
+    func emit(force: Bool = false) -> Bool {
         let now = clock()
-        guard now - lastEmission >= 1 else { return false }
+        // Mailbox deliveries are already rate-limited; align the timer with that slot
+        // rather than suppressing every delivery when the timer has a different phase.
+        guard force || now - lastEmission >= 1 else { return false }
         lastEmission = now; estimate = metrics.estimate(at: now); return true
     }
     var bytes: Int64 { metrics.bytes }

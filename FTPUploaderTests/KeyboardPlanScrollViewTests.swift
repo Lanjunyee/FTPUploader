@@ -147,7 +147,20 @@ final class KeyboardPlanScrollViewTests: XCTestCase {
         }
         return TransferPlan(direction: .download, roots: roots, nodes: nodes)
     }
+    @MainActor private final class Navigation: ObservableObject { @Published var target: UUID? }
+    private struct NavigationHarness<Content: View>: View {
+        @ObservedObject var navigation: Navigation
+        let content: Content
+        var body: some View {
+            ScrollViewReader { proxy in
+                content.onChange(of: navigation.target) { id in
+                    if let id { proxy.scrollTo(id, anchor: .center) }
+                }
+            }
+        }
+    }
     private struct AccessibilitySnapshot {
+        let object: NSObject
         let role: String?
         let label: String?
         let value: String?
@@ -171,7 +184,7 @@ final class KeyboardPlanScrollViewTests: XCTestCase {
                 typealias FrameGetter = @convention(c) (AnyObject, Selector) -> NSRect
                 frame = unsafeBitCast(object.method(for: selector), to: FrameGetter.self)(object, selector)
             }
-            result.append(.init(role: value(object, "accessibilityRole") as? String,
+            result.append(.init(object: object, role: value(object, "accessibilityRole") as? String,
                                 label: value(object, "accessibilityLabel") as? String,
                                 value: value(object, "accessibilityValue") as? String, frame: frame))
             for child in value(object, "accessibilityChildren") as? [Any] ?? [] { walk(child) }
@@ -237,6 +250,103 @@ final class KeyboardPlanScrollViewTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(cancel.frame.minY, visible.minY - 1)
         XCTAssertLessThanOrEqual(cancel.frame.maxY, visible.maxY + 1)
         XCTAssertTrue(keys.handleKey(key(115)))
+    }
+    func testLargeActualQueueReachesFirstMiddleLastWithoutImplicitNetworkRequests() async throws {
+        _ = NSApplication.shared
+        let setter = NSSelectorFromString("accessibilitySetValue:forAttribute:")
+        let getter = NSSelectorFromString("accessibilityAttributeValue:")
+        let previous = NSApp.perform(getter, with: "AXEnhancedUserInterface")?.takeUnretainedValue()
+        _ = NSApp.perform(setter, with: NSNumber(value: true), with: "AXEnhancedUserInterface")
+        defer { _ = NSApp.perform(setter, with: previous ?? NSNumber(value: false), with: "AXEnhancedUserInterface") }
+        for count in [1_000, 10_000] {
+            let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: base) }
+            let fake = ControlledFTP(), model = AppModel(client: fake, history: TransferHistory(url: base.appendingPathComponent("history.json")))
+            let original = try TransferScaleInput.plan(nodeCount: count, depth: 8)
+            let nodes = original.nodes.map { node in
+                TransferPlan.Node(id: node.id, rootID: node.rootID, kind: node.kind, source: node.source,
+                    target: .local(node.relativePath.reduce(base) { $0.appendingPathComponent($1.name) }),
+                    relativePath: node.relativePath, parentID: node.parentID, size: node.size, snapshot: node.snapshot)
+            }
+            let plan = TransferPlan(direction: .download, roots: original.roots, nodes: nodes)
+            try model.batch.prepare(plan: plan, endpoint: FTPEndpoint(address: "ftp://example.test"),
+                remoteRoot: RemotePath(), encoding: .utf8, credentials: .anonymous, destination: LocalDestinationRoot(url: base))
+            defer { model.batch.cancelAll() }
+            let navigation = Navigation()
+            let (window, hosting) = host(NavigationHarness(navigation: navigation, content: TransferPanel(model: model)), size: NSSize(width: 580, height: 420))
+            defer { window.close() }
+            try await Task.sleep(nanoseconds: 50_000_000); hosting.layoutSubtreeIfNeeded()
+            for index in [0, count / 2, count - 1] {
+                navigation.target = nodes[index].id
+                try await Task.sleep(nanoseconds: 80_000_000); hosting.layoutSubtreeIfNeeded()
+                let keys = try XCTUnwrap(findKeys(hosting)), scroll = try XCTUnwrap(keys.enclosingScrollView)
+                let viewport = window.convertToScreen(scroll.convert(scroll.bounds, to: nil))
+                let target = model.batch.items[index].target
+                let matches = accessibilityNodes(hosting).filter { ($0.label ?? $0.value ?? "").contains(target) }
+                XCTAssertTrue(matches.contains { $0.frame.intersects(viewport) },
+                    "Queue node \(index) of \(count) must remain reachable and visible: matches=\(matches.map(\.frame)), viewport=\(viewport), clip=\(scroll.contentView.bounds), document=\(scroll.documentView?.bounds ?? .zero)")
+            }
+            XCTAssertEqual(model.batch.items.map(\.id), nodes.map(\.id))
+            XCTAssertTrue(fake.browses.isEmpty); XCTAssertTrue(fake.uploads.isEmpty); XCTAssertTrue(fake.downloads.isEmpty)
+            let button = try XCTUnwrap(accessibilityNodes(hosting).first { $0.role == NSAccessibility.Role.button.rawValue && $0.label == "取消全部" })
+            let visible = window.convertToScreen(hosting.convert(hosting.bounds, to: nil))
+            XCTAssertGreaterThan(button.frame.width, 0); XCTAssertGreaterThanOrEqual(button.frame.minY, visible.minY - 1)
+            XCTAssertLessThanOrEqual(button.frame.maxY, visible.maxY + 1)
+            let selector = NSSelectorFromString("accessibilityPerformPress")
+            XCTAssertTrue(button.object.responds(to: selector))
+            typealias Press = @convention(c) (AnyObject, Selector) -> Bool
+            XCTAssertTrue(unsafeBitCast(button.object.method(for: selector), to: Press.self)(button.object, selector))
+            try await Task.sleep(nanoseconds: 30_000_000)
+            XCTAssertFalse(model.batch.isExecuting)
+            XCTAssertTrue(model.batch.items.allSatisfy { $0.state == .cancelled })
+            XCTAssertTrue(fake.browses.isEmpty); XCTAssertTrue(fake.uploads.isEmpty); XCTAssertTrue(fake.downloads.isEmpty)
+        }
+    }
+    func testLargeActualPreviewReachesFirstMiddleLastAndActivatesFooterWithoutTruncation() async throws {
+        _ = NSApplication.shared
+        let setter = NSSelectorFromString("accessibilitySetValue:forAttribute:")
+        let getter = NSSelectorFromString("accessibilityAttributeValue:")
+        let previous = NSApp.perform(getter, with: "AXEnhancedUserInterface")?.takeUnretainedValue()
+        _ = NSApp.perform(setter, with: NSNumber(value: true), with: "AXEnhancedUserInterface")
+        defer { _ = NSApp.perform(setter, with: previous ?? NSNumber(value: false), with: "AXEnhancedUserInterface") }
+        for count in [1_000, 10_000] {
+            let plan = try TransferScaleInput.plan(nodeCount: count, depth: 8), navigation = Navigation()
+            var starts = 0, cancels = 0, locationCalls = 0
+            let preview = TransferPlanPreviewContent(plan: plan, canRemoveRoots: false,
+                location: { value in
+                    locationCalls += 1
+                    switch value { case .remote(let path, _): return path.display; case .local(let url): return url.path }
+                }, issueTitle: { _ in "阻断" }, onRemove: { _ in }, onConfirm: { _ in starts += 1 }, onCancel: { cancels += 1 })
+                .padding(16)
+            let (window, hosting) = host(NavigationHarness(navigation: navigation, content: preview), size: NSSize(width: 580, height: 420))
+            defer { window.close() }
+            try await Task.sleep(nanoseconds: 50_000_000); hosting.layoutSubtreeIfNeeded()
+            XCTAssertLessThan(locationCalls, count, "Initial layout must not format every node's paths")
+            for index in [0, count / 2, count - 1] {
+                navigation.target = plan.nodes[index].id
+                try await Task.sleep(nanoseconds: 80_000_000); hosting.layoutSubtreeIfNeeded()
+                let expected = plan.nodes[index].relativePath.map(\.name).joined(separator: "/")
+                let keys = try XCTUnwrap(findKeys(hosting)), scroll = try XCTUnwrap(keys.enclosingScrollView)
+                let viewport = window.convertToScreen(scroll.convert(scroll.bounds, to: nil))
+                XCTAssertTrue(accessibilityNodes(hosting).contains { ($0.label ?? $0.value ?? "").contains(expected) && $0.frame.intersects(viewport) },
+                    "Requested node \(index) of \(count) must be in the visible viewport, not merely in AX data")
+            }
+            let nodes = accessibilityNodes(hosting)
+            for title in ["确认开始本计划", "取消计划"] {
+                let button = try XCTUnwrap(nodes.first { $0.role == NSAccessibility.Role.button.rawValue && $0.label == title })
+                let visible = window.convertToScreen(hosting.convert(hosting.bounds, to: nil))
+                XCTAssertGreaterThan(button.frame.width, 0); XCTAssertGreaterThanOrEqual(button.frame.minY, visible.minY - 1)
+                XCTAssertLessThanOrEqual(button.frame.maxY, visible.maxY + 1)
+                let selector = NSSelectorFromString("accessibilityPerformPress")
+                XCTAssertTrue(button.object.responds(to: selector))
+                typealias Press = @convention(c) (AnyObject, Selector) -> Bool
+                let press = unsafeBitCast(button.object.method(for: selector), to: Press.self)
+                XCTAssertTrue(press(button.object, selector))
+            }
+            XCTAssertEqual(starts, 1); XCTAssertEqual(cancels, 1)
+            XCTAssertEqual(plan.nodes.count, count, "Layout never truncates the actual plan")
+        }
     }
     func testActualPreviewExposesBothRootButtonsAndFooterAtMinimumSize() async throws {
         // Enable AX rendering only in this test process, not system VoiceOver.

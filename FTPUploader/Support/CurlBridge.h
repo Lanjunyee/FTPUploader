@@ -20,10 +20,25 @@ typedef struct {
 typedef struct {
     int code;
     long response_code;
+    int directory_attempted;
     int64_t bytes_sent;
     int64_t expected_size;
     char message[768];
 } FTPResult;
+
+/* Owner-local serial cache. Never share across fixed authentication/TLS contexts.
+   Destroy only after the active operation has returned. Errors poison the cache. */
+typedef struct FTPSession FTPSession;
+FTPSession *ftp_session_create(void);
+void ftp_session_destroy(FTPSession *session);
+FTPResult ftp_session_list(FTPSession *session, const char *url, const char *method, const char *username, const char *password, FTPOptions options,
+                          FTPDataCallback data, FTPCancelCallback cancel, void *context);
+FTPResult ftp_session_upload_fd(FTPSession *session, const char *url, int file_fd, const char *username, const char *password, FTPOptions options,
+                               FTPProgressCallback progress, FTPCancelCallback cancel, void *context);
+FTPResult ftp_session_download(FTPSession *session, const char *url, const char *username, const char *password, FTPOptions options,
+                              FTPDataCallback data, FTPProgressCallback progress, FTPCancelCallback cancel, void *context);
+FTPResult ftp_session_mkdir(FTPSession *session, const char *parent_url, const unsigned char *name, size_t length,
+                           const char *username, const char *password, FTPOptions options, FTPCancelCallback cancel, void *context);
 
 FTPResult ftp_mkdir(const char *parent_url, const unsigned char *name, size_t length, const char *username, const char *password,
                     FTPOptions options, FTPCancelCallback cancel, void *context);

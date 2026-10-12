@@ -17,6 +17,22 @@ final class SFTPClient: FTPServing, @unchecked Sendable {
     private let queue = DispatchQueue(label: "local.ftpuploader.sftp", qos: .userInitiated)
     private let trust: HostTrustStoring
     private let options: FTPOptions
+    private var driver: SSHTransportDriver?
+    private init(copying client: SFTPClient, driver: SSHTransportDriver) {
+        trust = client.trust; options = client.options; self.driver = driver
+    }
+    @MainActor
+    func makeSession(endpoint: FTPEndpoint, credentials: FTPCredentials, executor: TransferExecutor) throws -> ManagedSSHTransferSession {
+        guard endpoint.transport == .sftp, credentials.mode == .account, ssh_available() != 0 else {
+            throw FTPError.security("SFTP 会话需要可用后端及固定账户认证。")
+        }
+        let revision = try trust.sessionRevision()
+        let driver = try SSHTransportDriver()
+        let configuration = TransportConfiguration(connectTimeout: Int(options.connect_timeout),
+            responseTimeout: Int(options.response_timeout), stallTimeout: Int(options.stall_timeout))
+        return ManagedSSHTransferSession(endpoint: endpoint, credentials: credentials, backend: SFTPClient(copying: self, driver: driver),
+            driver: driver, configuration: configuration, trust: trust, revision: revision, executor: executor)
+    }
     init(trust: HostTrustStoring = HostTrustStore(), connectTimeout: Int = 15, responseTimeout: Int = 60, stallTimeout: Int = 60) {
         self.trust = trust
         options = FTPOptions(connect_timeout: connectTimeout, response_timeout: responseTimeout, stall_timeout: stallTimeout, tls_mode: 0, ca_file: nil)
@@ -90,7 +106,8 @@ final class SFTPClient: FTPServing, @unchecked Sendable {
                 let pointer = Unmanaged.passUnretained(context).toOpaque()
                 do {
                     try cancellation.checkCancellation()
-                    let result = withAuthentication(credentials) { key, length, phrase in ssh_list(endpoint.host, Int32(endpoint.port), remote, credentials.username, credentials.password, key, length, phrase, options,
+                    let handle = try driver?.borrow()
+                    let result = withAuthentication(credentials) { key, length, phrase in ssh_session_list(handle, endpoint.host, Int32(endpoint.port), remote, credentials.username, credentials.password, key, length, phrase, options,
                                           Self.hostCallback, Self.entryCallback, Self.cancelCallback, pointer) }
                     try validate(result, context: context)
                     continuation.resume(returning: DirectoryListing(entries: context.entries, encoding: .utf8))
@@ -112,11 +129,19 @@ final class SFTPClient: FTPServing, @unchecked Sendable {
                 let pointer = Unmanaged.passUnretained(context).toOpaque()
                 do {
                     try cancellation.checkCancellation()
+                    let handle = try driver?.borrow()
                     let result = withAuthentication(credentials) { key, length, phrase in
-                        ssh_mkdir(endpoint.host, Int32(endpoint.port), remote, credentials.username, credentials.password,
+                        ssh_session_mkdir(handle, endpoint.host, Int32(endpoint.port), remote, credentials.username, credentials.password,
                                   key, length, phrase, options, Self.hostCallback, Self.cancelCallback, pointer)
                     }
-                    try validate(result, context: context)
+                    do { try validate(result, context: context) }
+                    catch {
+                        if driver != nil, result.directory_attempted != 0, context.failure == nil, !cancellation.isCancelled,
+                           result.code != 0, result.code != -1000, result.code != -1003 {
+                            throw DirectoryCreationError(underlying: error)
+                        }
+                        throw error
+                    }
                     continuation.resume()
                 } catch { continuation.resume(throwing: error) }
             }
@@ -149,7 +174,8 @@ final class SFTPClient: FTPServing, @unchecked Sendable {
                 do {
                     try cancellation.checkCancellation()
                     try source.validateDescriptor()
-                    let result = withAuthentication(credentials) { key, length, phrase in ssh_upload_fd(endpoint.host, Int32(endpoint.port), remote, source.descriptor, credentials.username, credentials.password, key, length, phrase, options,
+                    let handle = try driver?.borrow()
+                    let result = withAuthentication(credentials) { key, length, phrase in ssh_session_upload_fd(handle, endpoint.host, Int32(endpoint.port), remote, source.descriptor, credentials.username, credentials.password, key, length, phrase, options,
                                             Self.hostCallback, { sent, total, pointer in
                         guard let pointer else { return }
                         let context = Unmanaged<Context>.fromOpaque(pointer).takeUnretainedValue()
@@ -174,7 +200,8 @@ final class SFTPClient: FTPServing, @unchecked Sendable {
                 let pointer = Unmanaged.passUnretained(context).toOpaque()
                 do {
                     try cancellation.checkCancellation()
-                    let result = withAuthentication(credentials) { key, length, phrase in ssh_download(endpoint.host, Int32(endpoint.port), remote, credentials.username, credentials.password, key, length, phrase, options,
+                    let handle = try driver?.borrow()
+                    let result = withAuthentication(credentials) { key, length, phrase in ssh_session_download(handle, endpoint.host, Int32(endpoint.port), remote, credentials.username, credentials.password, key, length, phrase, options,
                                               Self.hostCallback, { bytes, count, pointer in
                         guard let bytes, let pointer else { return 0 }
                         let context = Unmanaged<Context>.fromOpaque(pointer).takeUnretainedValue()

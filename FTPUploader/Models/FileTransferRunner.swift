@@ -44,9 +44,10 @@ final class FileTransferRunner {
     func run(_ job: TransferJob, preparing: () async throws -> Void = {},
              receive: ((Data) throws -> Void)? = nil, finalizing: () async throws -> Void = {},
              progress: @escaping (Int64, Int64) -> Void) async throws {
-        defer { job.byteCounter.finish() }
+        let counter = job.byteCounter
+        defer { counter.finish() }
         try await executor.execute(job) {
-            defer { job.uploadSource = nil }
+            defer { counter.finish(); job.uploadSource = nil }
             try await preparing()
             try job.cancellation.checkCancellation()
             switch job.direction {
@@ -57,16 +58,18 @@ final class FileTransferRunner {
                 }
                 try await client.upload(endpoint: job.endpoint, path: job.path, source: source,
                     encoding: job.encoding, credentials: job.credentials, cancellation: job.cancellation,
-                    progress: { bytes, total in job.byteCounter.sample(bytes); progress(bytes, total) })
+                    progress: { bytes, total in counter.sample(bytes); progress(bytes, total) })
                 job.completedFileBytes = source.expected.size
-                job.byteCounter.sample(source.expected.size)
+                counter.sample(source.expected.size)
             case .download:
                 guard let receive else { throw FTPError.localFile("下载任务缺少临时文件接收器。") }
                 try await client.download(endpoint: job.endpoint, path: job.path, credentials: job.credentials,
                     cancellation: job.cancellation,
-                    receive: { data in job.byteCounter.receive(data.count); try receive(data) },
-                    progress: { bytes, total in job.byteCounter.sample(bytes); progress(bytes, total) })
+                    receive: { data in counter.receive(data.count); try receive(data) },
+                    progress: { bytes, total in counter.sample(bytes); progress(bytes, total) })
             }
+            // The backend has stopped; user confirmation/local commit must not extend traffic accounting.
+            counter.finish()
             try job.cancellation.checkCancellation()
             try await finalizing()
             // Success is committed only after protocol completion and local finalization.

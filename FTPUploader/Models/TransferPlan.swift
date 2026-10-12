@@ -37,6 +37,44 @@ struct TransferPlan {
             self.size = kind == .regularFile ? size : nil; self.snapshot = snapshot
         }
     }
+    /// Immutable indexes follow the same ordered node/root arrays as legacy first/filter lookups.
+    struct Index {
+        let nodesByRoot: [UUID: [Node]]
+        let childrenByParent: [UUID: [Node]]
+        let positionByID: [UUID: Int]
+        private let nodesByID: [UUID: Node]
+        private let duplicateNodes: [UUID: [Node]]
+        private let rootsByID: [UUID: Root]
+        private let directoriesByRoot: [UUID: [[String]: (UInt64, UInt64)]]
+        private let diagnostics: TransferDiagnostics?
+
+        init(nodes: [Node], roots: [Root], diagnostics: TransferDiagnostics?) {
+            var byID: [UUID: Node] = [:], duplicates: [UUID: [Node]] = [:], positions: [UUID: Int] = [:]
+            var byRoot: [UUID: [Node]] = [:], children: [UUID: [Node]] = [:]
+            var directories: [UUID: [[String]: (UInt64, UInt64)]] = [:]
+            for (position, node) in nodes.enumerated() {
+                diagnostics?.record(.planIndexNodes)
+                if byID[node.id] == nil { byID[node.id] = node; positions[node.id] = position }
+                else { duplicates[node.id, default: []].append(node) }
+                byRoot[node.rootID, default: []].append(node)
+                if let parent = node.parentID { children[parent, default: []].append(node) }
+                if case .localDirectory(let device, let inode) = node.snapshot {
+                    directories[node.rootID, default: [:]][node.relativePath.dropFirst().map(\.name)] = (device, inode)
+                }
+            }
+            nodesByID = byID; duplicateNodes = duplicates; positionByID = positions
+            nodesByRoot = byRoot; childrenByParent = children; directoriesByRoot = directories
+            rootsByID = Dictionary(roots.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            self.diagnostics = diagnostics
+        }
+        func node(id: UUID) -> Node? { diagnostics?.record(.planNodeLookups); return nodesByID[id] }
+        func contains(_ node: Node) -> Bool { self.node(id: node.id) == node || duplicateNodes[node.id]?.contains(node) == true }
+        func root(id: UUID) -> Root? { diagnostics?.record(.planRootLookups); return rootsByID[id] }
+        func localDirectories(rootID: UUID) -> [[String]: (UInt64, UInt64)] {
+            diagnostics?.record(.planDirectoryLookups)
+            return directoriesByRoot[rootID] ?? [:]
+        }
+    }
     struct Issue: Equatable {
         enum Reason: Equatable {
             case overlappingRoots, duplicateTarget, typeConflict, localAlias, invalidName
@@ -52,6 +90,7 @@ struct TransferPlan {
     let direction: TransferDirection
     let roots: [Root]
     let nodes: [Node]
+    let index: Index
     let issues: [Issue]
     /// Read-only preview findings, never an overwrite grant.
     let existingTargetIDs: Set<UUID>
@@ -71,10 +110,12 @@ struct TransferPlan {
     static let maximumListingBytes = 16 * 1024 * 1024
 
     init(id: UUID = UUID(), direction: TransferDirection, roots: [Root], nodes: [Node], issues: [Issue] = [],
-         existingTargetIDs: Set<UUID> = []) {
+         existingTargetIDs: Set<UUID> = [], diagnostics: TransferDiagnostics? = nil) {
         self.id = id; self.direction = direction; self.roots = roots
-        self.nodes = Self.ordered(nodes, roots: roots)
-        self.issues = issues + Self.validate(direction: direction, roots: roots, nodes: nodes)
+        let ordered = Self.ordered(nodes, roots: roots)
+        self.nodes = ordered
+        self.index = Index(nodes: ordered, roots: roots, diagnostics: diagnostics)
+        self.issues = issues + Self.validate(direction: direction, roots: roots, nodes: nodes, diagnostics: diagnostics)
         self.existingTargetIDs = existingTargetIDs
     }
 
@@ -115,14 +156,19 @@ struct TransferPlan {
             $0.precomposedStringWithCanonicalMapping.folding(options: [.caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
         }
     }
-    private static func validate(direction: TransferDirection, roots: [Root], nodes: [Node]) -> [Issue] {
+    private static func validate(direction: TransferDirection, roots: [Root], nodes: [Node], diagnostics: TransferDiagnostics?) -> [Issue] {
         var issues: [Issue] = []
         func add(_ root: UUID, _ node: UUID?, _ location: Location, _ reason: Issue.Reason) {
             issues.append(Issue(rootID: root, nodeID: node, path: path(location), reason: reason))
         }
+        let rootKeys = roots.map { root in
+            diagnostics?.record(.planRootKeys)
+            return segments(root.source)
+        }
+        let rootIDs = Set(roots.map(\.id))
         for (i, root) in roots.enumerated() {
-            for previous in roots.prefix(i) where sameDomain(root.source, previous.source) {
-                let a = segments(root.source), b = segments(previous.source)
+            for (j, previous) in roots.prefix(i).enumerated() where sameDomain(root.source, previous.source) {
+                let a = rootKeys[i], b = rootKeys[j]
                 if a == b || (previous.kind == .directory && a.starts(with: b)) || (root.kind == .directory && b.starts(with: a)) {
                     add(root.id, nil, root.source, .overlappingRoots)
                 }
@@ -150,7 +196,8 @@ struct TransferPlan {
             case (.upload, .local, .remote), (.download, .remote, .local): break
             default: add(node.rootID, node.id, node.target, .invalidDirection)
             }
-            if !roots.contains(where: { $0.id == node.rootID }) || node.relativePath.isEmpty {
+            diagnostics?.record(.planNodeMembershipChecks)
+            if !rootIDs.contains(node.rootID) || node.relativePath.isEmpty {
                 add(node.rootID, node.id, node.source, .invalidDependency)
             }
             for component in node.relativePath {

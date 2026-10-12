@@ -22,8 +22,8 @@ final class CollectionProtocolMatrixTests: XCTestCase {
         var endpoint: FTPEndpoint { ftp?.endpoint ?? ssh!.endpoint }
         init(_ mode: Mode) throws {
             self.mode = mode
-            ftp = mode.transport == .sftp ? nil : try FTPFixture(scenario: mode.encoding == .gb18030 ? "legacy" : "normal", delay: 3, transport: mode.transport)
-            ssh = mode.transport == .sftp ? try SFTPFixture(delay: 3, keyAuth: mode.key) : nil
+            ftp = mode.transport == .sftp ? nil : try FTPFixture(scenario: mode.encoding == .gb18030 ? "legacy" : "normal", delay: 3, transport: mode.transport, countOperations: true)
+            ssh = mode.transport == .sftp ? try SFTPFixture(delay: 3, keyAuth: mode.key, countOperations: true) : nil
             let root = ftp?.root ?? ssh!.root
             let trust = HostTrustStore(url: root.appendingPathComponent(".matrix-trust.json"))
             if let ssh { try trust.trust(ssh.identity) }
@@ -36,6 +36,7 @@ final class CollectionProtocolMatrixTests: XCTestCase {
             }
         }
         func commands() throws -> [[String: String]] { try ftp?.commands() ?? ssh!.commands() }
+        func counts() throws -> [String: Int64] { try XCTUnwrap(ftp?.operationCounts() ?? ssh!.operationCounts()) }
         func stop() { ftp?.stop(); ssh?.stop() }
     }
     private var modes: [Mode] {
@@ -110,6 +111,15 @@ final class CollectionProtocolMatrixTests: XCTestCase {
             }
         }
     }
+    private func connectionEvidence(_ wire: Wire, stage: String, before: [String: Int64]) throws {
+        let after = try wire.counts()
+        let delta = after.reduce(into: [String: Int64]()) { counts, pair in counts[pair.key] = pair.value - (before[pair.key] ?? 0) }
+        XCTAssertEqual(delta["connections"], 1, wire.mode.label + " " + stage)
+        XCTAssertEqual(delta["authentications"], wire.mode.key ? 2 : 1, wire.mode.label + " " + stage)
+        let numeric: [String: Any] = ["mode": wire.mode.label, "stage": stage, "counts": delta]
+        let data = try JSONSerialization.data(withJSONObject: numeric, options: [.sortedKeys])
+        print("TRANSFER_SESSION_MATRIX " + String(decoding: data, as: UTF8.self))
+    }
     private func evidence(_ wire: Wire, stage: String, plan: TransferPlan, queue: BatchTransferQueue, base: URL, start: Int) throws {
         let summary = try XCTUnwrap(queue.summary)
         let nodes: [[String: Any]] = try zip(plan.nodes, queue.items).map { node, item in
@@ -162,14 +172,18 @@ final class CollectionProtocolMatrixTests: XCTestCase {
         var start = try wire.commands().count
         let (up, queue) = try await upload([tree, single], wire: wire)
         XCTAssertEqual(up.nodes.count, 9); XCTAssertEqual(try contentCount(wire), 0)
-        try await run(up, queue); XCTAssertEqual(queue.state, .finished); XCTAssertTrue(queue.summary?.allSuccessful == true); XCTAssertFalse(queue.hasCredentials)
+        let uploadCounts = try wire.counts()
+        try await run(up, queue); try connectionEvidence(wire, stage: "upload-merge", before: uploadCounts)
+        XCTAssertEqual(queue.state, .finished); XCTAssertTrue(queue.summary?.allSuccessful == true); XCTAssertFalse(queue.hasCredentials)
         try verifyPlanFiles(up, base: wire.root)
         XCTAssertEqual(try Data(contentsOf: remoteTree.appendingPathComponent("keep-extra.txt")), extra)
         XCTAssertEqual(queue.items.filter(\.reusedDirectory).count, 2)
         try evidence(wire, stage: "upload-merge", plan: up, queue: queue, base: wire.root, start: start)
         let beforeSkip = try contentCount(wire); start = try wire.commands().count
         let (skipUp, skippedUp) = try await upload([tree, single], wire: wire)
+        let skipUploadCounts = try wire.counts()
         try await run(skipUp, skippedUp, policy: .skipExistingFiles)
+        try connectionEvidence(wire, stage: "upload-skip-existing", before: skipUploadCounts)
         XCTAssertEqual(skippedUp.summary?.skipped, 4); XCTAssertEqual(skippedUp.summary?.succeeded, 5)
         XCTAssertFalse(skippedUp.summary?.allSuccessful ?? true); XCTAssertEqual(try contentCount(wire), beforeSkip)
         try verifyPlanFiles(skipUp, base: wire.root)
@@ -183,7 +197,9 @@ final class CollectionProtocolMatrixTests: XCTestCase {
         start = try wire.commands().count
         let (down, downloaded) = try await download([tree.lastPathComponent, single.lastPathComponent], to: destination, wire: wire)
         XCTAssertEqual(down.nodes.count, 10)
+        let downloadCounts = try wire.counts()
         try await run(down, downloaded, policy: .overwriteExistingFiles)
+        try connectionEvidence(wire, stage: "download-merge", before: downloadCounts)
         XCTAssertEqual(downloaded.state, .finished); XCTAssertTrue(downloaded.summary?.allSuccessful == true); XCTAssertFalse(downloaded.hasCredentials)
         for node in down.nodes {
             let relative = node.relativePath.map(\.name).joined(separator: "/")
@@ -195,7 +211,9 @@ final class CollectionProtocolMatrixTests: XCTestCase {
         try evidence(wire, stage: "download-merge-overwrite", plan: down, queue: downloaded, base: destination, start: start)
         let beforeDownloadSkip = try contentCount(wire); start = try wire.commands().count
         let (skipDown, skippedDown) = try await download([tree.lastPathComponent, single.lastPathComponent], to: destination, wire: wire)
+        let skipDownloadCounts = try wire.counts()
         try await run(skipDown, skippedDown, policy: .skipExistingFiles)
+        try connectionEvidence(wire, stage: "download-skip-existing", before: skipDownloadCounts)
         XCTAssertEqual(skippedDown.summary?.skipped, 5); XCTAssertEqual(skippedDown.summary?.succeeded, 5)
         XCTAssertEqual(try contentCount(wire), beforeDownloadSkip); XCTAssertFalse(skippedDown.summary?.allSuccessful ?? true)
         try evidence(wire, stage: "download-skip-existing", plan: skipDown, queue: skippedDown, base: destination, start: start)

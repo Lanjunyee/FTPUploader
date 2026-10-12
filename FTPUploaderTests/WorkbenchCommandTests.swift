@@ -5,6 +5,8 @@ import XCTest
 @MainActor
 final class WorkbenchCommandTests: XCTestCase {
     private struct AXControl {
+        let object: NSObject
+        let frame: NSRect
         let role: String?
         let label: String?
         let title: String?
@@ -27,7 +29,13 @@ final class WorkbenchCommandTests: XCTestCase {
                 typealias Getter = @convention(c) (AnyObject, Selector) -> Bool
                 enabled = unsafeBitCast(object.method(for: selector), to: Getter.self)(object, selector)
             }
-            result.append(AXControl(role: value(object, "accessibilityRole") as? String,
+            let frameSelector = NSSelectorFromString("accessibilityFrame")
+            var frame = NSRect.zero
+            if object.responds(to: frameSelector) {
+                typealias FrameGetter = @convention(c) (AnyObject, Selector) -> NSRect
+                frame = unsafeBitCast(object.method(for: frameSelector), to: FrameGetter.self)(object, frameSelector)
+            }
+            result.append(AXControl(object: object, frame: frame, role: value(object, "accessibilityRole") as? String,
                                     label: value(object, "accessibilityLabel") as? String,
                                     title: value(object, "accessibilityTitle") as? String,
                                     value: value(object, "accessibilityValue") as? String, enabled: enabled))
@@ -105,6 +113,132 @@ final class WorkbenchCommandTests: XCTestCase {
         }
     }
 
+    private func waitFor(_ condition: () -> Bool) async throws {
+        for _ in 0..<300 {
+            if condition() { return }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTFail("Hosted window did not reach expected state")
+        throw FTPError.localFile("Hosted window wait timed out")
+    }
+    private func enableAX() -> () -> Void {
+        _ = NSApplication.shared
+        let setter = NSSelectorFromString("accessibilitySetValue:forAttribute:")
+        let getter = NSSelectorFromString("accessibilityAttributeValue:")
+        let previous = NSApp.perform(getter, with: "AXEnhancedUserInterface")?.takeUnretainedValue()
+        _ = NSApp.perform(setter, with: NSNumber(value: true), with: "AXEnhancedUserInterface")
+        return { _ = NSApp.perform(setter, with: previous ?? NSNumber(value: false), with: "AXEnhancedUserInterface") }
+    }
+    private func hostMain(_ model: AppModel, bus: TransferCommandBus, appearance: NSAppearance.Name) -> NSWindow {
+        let controller = NSHostingController(rootView: ContentView(model: model).environmentObject(bus))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: Metrics.minimumWindowWidth, height: Metrics.minimumWindowHeight),
+            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.appearance = NSAppearance(named: appearance)
+        window.contentViewController = controller
+        window.makeKeyAndOrderFront(nil)
+        return window
+    }
+    private func press(_ control: AXControl) throws {
+        if let button = control.object as? NSButton {
+            XCTAssertTrue(button.isEnabled)
+            button.performClick(nil)
+            return
+        }
+        let selector = NSSelectorFromString("accessibilityPerformPress")
+        XCTAssertTrue(control.object.responds(to: selector))
+        typealias Press = @convention(c) (AnyObject, Selector) -> Bool
+        XCTAssertTrue(unsafeBitCast(control.object.method(for: selector), to: Press.self)(control.object, selector))
+    }
+    func testMinimumMainWindowLightAndDarkKeepRiskSummaryAndCancellationReachable() async throws {
+        let restore = enableAX(); defer { restore() }
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: base) }
+            let url = base.appendingPathComponent("中文 %.txt"); try Data("abcdef".utf8).write(to: url)
+            let fake = ControlledFTP(), model = AppModel(client: fake, history: TransferHistory(url: base.appendingPathComponent("history.json")))
+            model.address = "example.test"; model.connect(); try await waitFor { fake.browses.count == 1 }
+            fake.browses[0].continuation.resume(returning: .init(entries: [], encoding: .utf8)); try await waitFor { model.hasDirectory }
+            let bus = TransferCommandBus(), window = hostMain(model, bus: bus, appearance: appearance)
+            defer { window.close() }
+            model.selectFile(url); model.upload(); try await waitFor { fake.uploads.count == 1 }
+            fake.uploads[0].progress(6, 6); try await waitFor { model.uploadState == .awaitingCompletion }
+            try await Task.sleep(nanoseconds: 80_000_000); window.contentView?.layoutSubtreeIfNeeded()
+            let controls = elements(window.contentView!), warning = try XCTUnwrap(TransferActivityObserver(model: model).activity?.warning)
+            let visible = window.convertToScreen(window.contentView!.bounds)
+            XCTAssertTrue(controls.contains { ($0.label == warning || $0.value == warning) && $0.frame.intersects(visible) })
+            let cancel = try XCTUnwrap(controls.first { ($0.label == "取消当前" || $0.title == "取消当前") && $0.enabled == true })
+            XCTAssertTrue(cancel.frame.intersects(visible))
+            try press(cancel)
+            XCTAssertEqual(model.uploadState, .cancelling)
+            fake.uploads[0].continuation.resume(throwing: CancellationError()); try await waitFor { !model.isBusy }
+            try await Task.sleep(nanoseconds: 50_000_000); window.contentView?.layoutSubtreeIfNeeded()
+            let cancelledWarning = try XCTUnwrap(TransferActivityObserver(model: model).activity?.warning)
+            XCTAssertTrue(elements(window.contentView!).contains { ($0.label == cancelledWarning || $0.value == cancelledWarning) && $0.frame.intersects(visible) })
+            XCTAssertEqual(fake.uploads.count, 1); XCTAssertEqual(fake.browses.count, 1)
+        }
+    }
+    func testMinimumMainWindowOverwriteDefaultsToCancelInBothAppearances() async throws {
+        let restore = enableAX(); defer { restore() }
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: base) }
+            let url = base.appendingPathComponent("existing.txt"); try Data("abc".utf8).write(to: url)
+            let fake = ControlledFTP(); fake.autoCheckTargets = false
+            let model = AppModel(client: fake, history: TransferHistory(url: base.appendingPathComponent("history.json")))
+            model.address = "example.test"; model.connect(); try await waitFor { fake.browses.count == 1 }
+            fake.browses[0].continuation.resume(returning: .init(entries: [], encoding: .utf8)); try await waitFor { model.hasDirectory }
+            let window = hostMain(model, bus: TransferCommandBus(), appearance: appearance); defer { window.close() }
+            model.selectFile(url); model.upload(); try await waitFor { fake.browses.count == 2 }
+            fake.browses[1].continuation.resume(returning: .init(entries: [.init(name: url.lastPathComponent, rawName: Data(url.lastPathComponent.utf8), isDirectory: false, size: 3)], encoding: .utf8))
+            try await waitFor { model.overwriteRequestID != nil && window.attachedSheet != nil }
+            let id = try XCTUnwrap(model.overwriteRequestID), sheet = try XCTUnwrap(window.attachedSheet)
+            try await Task.sleep(nanoseconds: 300_000_000); sheet.contentView?.layoutSubtreeIfNeeded()
+            XCTAssertEqual(sheet.defaultButtonCell?.title, "取消")
+            let cancel = try XCTUnwrap(elements(sheet.contentView!).first {
+                $0.role == NSAccessibility.Role.button.rawValue && ($0.label == "取消" || $0.title == "取消")
+            })
+            XCTAssertTrue(cancel.enabled == true)
+            // AppKit exposes an AX proxy for alert buttons. Activate the actual default
+            // NSButton, then verify the model effect instead of trusting a proxy return value.
+            let defaultButton = try XCTUnwrap(sheet.defaultButtonCell?.controlView as? NSButton)
+            XCTAssertTrue(defaultButton.isEnabled)
+            defaultButton.performClick(nil); try await waitFor { !model.isBusy }
+            model.confirmOverwrite(id)
+            XCTAssertEqual(model.uploadState, .cancelled); XCTAssertTrue(fake.uploads.isEmpty)
+        }
+    }
+    func testMainWindowDetailsDismissWhenSameNameSelectionObjectChangesInBothAppearances() async throws {
+        let restore = enableAX(); defer { restore() }
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: base) }
+            let url = base.appendingPathComponent("same-name.txt"); try Data("abc".utf8).write(to: url)
+            let fake = ControlledFTP(), model = AppModel(client: fake, history: TransferHistory(url: base.appendingPathComponent("history.json")))
+            model.address = "example.test"; model.connect(); try await waitFor { fake.browses.count == 1 }
+            fake.browses[0].continuation.resume(returning: .init(entries: [], encoding: .utf8)); try await waitFor { model.hasDirectory }
+            let bus = TransferCommandBus(), window = hostMain(model, bus: bus, appearance: appearance); defer { window.close() }
+            model.selectFile(url); try await Task.sleep(nanoseconds: 80_000_000)
+            let original = try XCTUnwrap(model.selectedFile), target = try XCTUnwrap(model.pendingTarget)
+            func popoverControls() -> [AXControl] {
+                NSApp.windows.filter { $0.isVisible && $0 !== window }.flatMap { $0.contentView.map { elements($0) } ?? [] }
+            }
+            bus.send(.showTarget)
+            try await waitFor { popoverControls().contains { $0.value == "完整上传目标" || $0.label == "完整上传目标" } }
+            let details = popoverControls()
+            XCTAssertTrue(details.contains { $0.value == target || $0.label == target })
+            for title in ["复制", "关闭"] {
+                XCTAssertTrue(details.contains { ($0.title == title || $0.label == title) && $0.enabled == true })
+            }
+            model.selectFile(url)
+            XCTAssertFalse(model.selectedFile === original); XCTAssertEqual(model.pendingTarget, target)
+            try await waitFor { !popoverControls().contains { $0.value == "完整上传目标" || $0.label == "完整上传目标" } }
+            XCTAssertEqual(fake.browses.count, 1); XCTAssertTrue(fake.uploads.isEmpty)
+        }
+    }
     func testNativeFilterDelegatePublishesContinuousInputAndConsumesOnlyLocalCommands() {
         var query = "", escaped: [String] = []
         let fieldView = DirectoryFilterField(query: Binding(get: { query }, set: { query = $0 }),

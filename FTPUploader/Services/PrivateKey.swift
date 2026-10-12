@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import Darwin
 
 // Only a file authorization and a digest are serializable, never key bytes.
 struct PrivateKeyReference: Codable, Equatable, CustomStringConvertible, CustomDebugStringConvertible {
@@ -31,6 +32,100 @@ final class PrivateKeyAccess: PrivateKeyAccessing {
     private let create: (URL) throws -> Data
     private let restore: (Data) throws -> (URL, Bool)
     private let readBytes: (FileHandle, Int) throws -> Data
+    private let openFile: (URL, Int32) throws -> Int32
+
+    private struct FileIdentity: Equatable {
+        let device: dev_t
+        let inode: ino_t
+        let mode: mode_t
+        let size: off_t
+        let modifiedSeconds: Int
+        let modifiedNanos: Int
+        let changedSeconds: Int
+        let changedNanos: Int
+        init(_ value: stat) {
+            device = value.st_dev; inode = value.st_ino; mode = value.st_mode
+            size = value.st_size
+            modifiedSeconds = value.st_mtimespec.tv_sec; modifiedNanos = value.st_mtimespec.tv_nsec
+            changedSeconds = value.st_ctimespec.tv_sec; changedNanos = value.st_ctimespec.tv_nsec
+        }
+    }
+    /// Search-only ancestor descriptors never enumerate directories or broaden scope.
+    /// Initial path aliases may resolve, but their identities and the real chain are pinned.
+    private struct Ancestors {
+        let originalPaths: [(String, LocalRootIdentity)]
+        let components: [String]
+        let identities: [LocalRootIdentity]
+
+        init(parent: URL) throws {
+            let path = parent.path
+            let parts = path.split(separator: "/").map(String.init)
+            var paths: [(String, LocalRootIdentity)] = []
+            for count in 0...parts.count {
+                let prefix = "/" + parts.prefix(count).joined(separator: "/")
+                paths.append((prefix, try Self.pathIdentity(prefix)))
+            }
+            let resolved = path.withCString { realpath($0, nil) }
+            guard let resolved else { throw PrivateKeyAccess.changed() }
+            defer { free(resolved) }
+            // Use POSIX bytes: Foundation may shorten /private/var to /var again.
+            components = String(cString: resolved).split(separator: "/").map(String.init)
+            identities = try Self.walk(components)
+            originalPaths = paths
+            try validate()
+        }
+        private static func pathIdentity(_ path: String) throws -> LocalRootIdentity {
+            var value = stat()
+            guard path.withCString({ lstat($0, &value) }) == 0,
+                  value.st_mode & S_IFMT == S_IFDIR || value.st_mode & S_IFMT == S_IFLNK else {
+                throw PrivateKeyAccess.changed()
+            }
+            return LocalRootIdentity(value)
+        }
+        private static func walk(_ components: [String]) throws -> [LocalRootIdentity] {
+            var fd = Darwin.open("/", O_SEARCH | O_NOFOLLOW | O_CLOEXEC)
+            guard fd >= 0 else { throw PrivateKeyAccess.changed() }
+            defer { Darwin.close(fd) }
+            func identity() throws -> LocalRootIdentity {
+                var value = stat()
+                guard fstat(fd, &value) == 0, value.st_mode & S_IFMT == S_IFDIR else { throw PrivateKeyAccess.changed() }
+                return LocalRootIdentity(value)
+            }
+            var result = [try identity()]
+            for name in components {
+                let next = name.withCString { openat(fd, $0, O_SEARCH | O_NOFOLLOW | O_CLOEXEC) }
+                guard next >= 0 else { throw PrivateKeyAccess.changed() }
+                Darwin.close(fd); fd = next
+                result.append(try identity())
+            }
+            return result
+        }
+        func validate() throws {
+            for (path, expected) in originalPaths {
+                guard try Self.pathIdentity(path) == expected else { throw PrivateKeyAccess.changed() }
+            }
+            guard try Self.walk(components) == identities else { throw PrivateKeyAccess.changed() }
+        }
+    }
+    private static func changed() -> FieldIssue {
+        FieldIssue(field: .privateKey, message: "读取期间私钥发生变化，请重新选择。")
+    }
+    private static func validate(_ value: stat) throws -> FileIdentity {
+        guard value.st_mode & S_IFMT == S_IFREG, value.st_size > 0, value.st_size <= limit else {
+            throw FieldIssue(field: .privateKey, message: "请选择非空、可读且不超过 1 MiB 的普通私钥文件。")
+        }
+        return FileIdentity(value)
+    }
+    private static func pathIdentity(_ url: URL) throws -> FileIdentity {
+        var value = stat()
+        guard url.withUnsafeFileSystemRepresentation({ $0.map { lstat($0, &value) } ?? -1 }) == 0 else { throw changed() }
+        return try validate(value)
+    }
+    private static func descriptorIdentity(_ descriptor: Int32) throws -> FileIdentity {
+        var value = stat()
+        guard fstat(descriptor, &value) == 0 else { throw changed() }
+        return try validate(value)
+    }
     init(start: @escaping (URL) -> Bool = { $0.startAccessingSecurityScopedResource() },
          stop: @escaping (URL) -> Void = { $0.stopAccessingSecurityScopedResource() },
          create: @escaping (URL) throws -> Data = { try $0.bookmarkData(options: [.withSecurityScope, .securityScopeAllowOnlyReadAccess], includingResourceValuesForKeys: nil, relativeTo: nil) },
@@ -38,28 +133,39 @@ final class PrivateKeyAccess: PrivateKeyAccessing {
              var stale = false
              let url = try URL(resolvingBookmarkData: bookmark, options: [.withSecurityScope, .withoutUI], relativeTo: nil, bookmarkDataIsStale: &stale)
              return (url, stale)
-         }, readBytes: @escaping (FileHandle, Int) throws -> Data = { try $0.read(upToCount: $1) ?? Data() }) {
+         }, readBytes: @escaping (FileHandle, Int) throws -> Data = { try $0.read(upToCount: $1) ?? Data() },
+         openFile: @escaping (URL, Int32) throws -> Int32 = { url, flags in
+             url.withUnsafeFileSystemRepresentation { $0.map { Darwin.open($0, flags) } ?? -1 }
+         }) {
         self.start = start; self.stop = stop; self.create = create; self.restore = restore; self.readBytes = readBytes
+        self.openFile = openFile
     }
     func read(_ url: URL) throws -> PrivateKeyMaterial {
         let scoped = start(url)
         defer { if scoped { stop(url) } }
         do {
-            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-            guard attributes[.type] as? FileAttributeType == .typeRegular,
-                  let size = attributes[.size] as? NSNumber, size.intValue > 0, size.intValue <= Self.limit else {
-                throw FieldIssue(field: .privateKey, message: "请选择非空、可读且不超过 1 MiB 的普通私钥文件。")
-            }
-            let handle = try FileHandle(forReadingFrom: url)
+            guard url.isFileURL else { throw Self.changed() }
+            let initial = try Self.pathIdentity(url)
+            let ancestors = try Ancestors(parent: url.deletingLastPathComponent())
+            let descriptor = try openFile(url, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+            guard descriptor >= 0 else { throw Self.changed() }
+            let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
             defer { try? handle.close() }
-            let bytes = try readBytes(handle, Self.limit + 1)
-            let after = try FileManager.default.attributesOfItem(atPath: url.path)
-            guard bytes.count == size.intValue, bytes.count <= Self.limit,
-                  attributes[.systemFileNumber] as? NSNumber == after[.systemFileNumber] as? NSNumber,
-                  attributes[.modificationDate] as? Date == after[.modificationDate] as? Date,
-                  after[.size] as? NSNumber == size else {
-                throw FieldIssue(field: .privateKey, message: "读取期间私钥发生变化，请重新选择。")
+            guard try Self.descriptorIdentity(descriptor) == initial else { throw Self.changed() }
+            try ancestors.validate()
+            // One extra byte detects growth; each allocation and the final buffer are bounded.
+            var bytes = Data()
+            while bytes.count <= Self.limit {
+                let requested = min(64 * 1024, Self.limit + 1 - bytes.count)
+                let chunk = try readBytes(handle, requested)
+                guard chunk.count <= requested else { throw Self.changed() }
+                if chunk.isEmpty { break }
+                bytes.append(chunk)
             }
+            guard bytes.count == initial.size, bytes.count <= Self.limit,
+                  try Self.descriptorIdentity(descriptor) == initial,
+                  try Self.pathIdentity(url) == initial else { throw Self.changed() }
+            try ancestors.validate()
             guard let text = String(data: bytes, encoding: .utf8),
                   ["-----BEGIN OPENSSH PRIVATE KEY-----", "-----BEGIN RSA PRIVATE KEY-----",
                    "-----BEGIN PRIVATE KEY-----", "-----BEGIN ENCRYPTED PRIVATE KEY-----"].contains(where: { text.hasPrefix($0) }) else {

@@ -191,7 +191,10 @@ final class AppModel: ObservableObject {
     let sites: SiteManager
     @Published private(set) var endpoint: FTPEndpoint?
     @Published private(set) var path = RemotePath.root
-    @Published private(set) var entries: [RemoteEntry] = []
+    private(set) var directoryContentRevision: UInt64 = 0
+    @Published private(set) var entries: [RemoteEntry] = [] {
+        didSet { directoryContentRevision &+= 1 }
+    }
     @Published private(set) var isDirectoryLoading = false
     @Published private(set) var isDirectoryCancelling = false
     @Published private(set) var directoryCancelled = false
@@ -204,6 +207,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var overwriteTarget: String?
     @Published private(set) var overwriteRequestID: UUID?
     @Published private(set) var sent: Int64 = 0
+    @Published private(set) var uploadTrafficOverflow = false
     @Published private(set) var total: Int64 = 0
 
     @Published private(set) var downloadState = UploadState.idle
@@ -211,50 +215,31 @@ final class AppModel: ObservableObject {
     @Published private(set) var downloadName: String?
     @Published private(set) var downloadCleanupError: String?
     @Published private(set) var downloadBytes: Int64 = 0
+    @Published private(set) var downloadTrafficOverflow = false
     @Published private(set) var downloadTotal: Int64 = -1
     @Published private(set) var downloadConfirmationID: UUID?
-    private var downloadCancellation: FTPCancellationToken?
-    private var pendingDownload: LocalDownload?
-    private var downloadCommitContinuation: CheckedContinuation<Void, Error>?
-    private let files: FileTransferRunner
-    let batch: BatchTransferQueue
+    private let connectionCoordinator: ConnectionSessionCoordinator
+    private let singleFileCoordinator: SingleFileTransferCoordinator
+    private var downloadCancellation: FTPCancellationToken? {
+        get { singleFileCoordinator.downloadCancellation }
+        set { singleFileCoordinator.downloadCancellation = newValue }
+    }
+    private var uploadConnection: TransferConnectionOwner? { singleFileCoordinator.uploadConnection }
+    private var downloadConnection: TransferConnectionOwner? { singleFileCoordinator.downloadConnection }
+    private let collectionCoordinator: CollectionTransferCoordinator
+    var batch: BatchTransferQueue { collectionCoordinator.batch }
     /// A retry has independent ids/results; the original queue never executes it in place.
     @Published private(set) var retryBatch: BatchTransferQueue
-    private(set) var retryBatches: [BatchTransferQueue] = []
+    var retryBatches: [BatchTransferQueue] { collectionCoordinator.retries }
     private let transferExecutor: TransferExecutor
     var sessionQueues: [BatchTransferQueue] { [batch] + retryBatches }
     var sessionSummary: TransferSessionSummary? {
         guard let original = batch.summary else { return nil }
         return TransferSessionSummary(original: original, retries: retryBatches.compactMap(\.summary))
     }
-    let collectionScan = TransferScanSession()
+    var collectionScan: TransferScanSession { collectionCoordinator.scan }
     private let rootScope: LocalSecurityScope
-    private final class CollectionPreparation {
-        let endpoint: FTPEndpoint
-        let remoteRoot: RemotePath
-        let encoding: FTPTextEncoding
-        let credentials: FTPCredentials
-        var roots: [LocalSourceRoot] = []
-        var sources: [UUID: LocalSourceRoot] = [:]
-        var destination: LocalDestinationRoot?
-        var isRetry = false
-        var retryOrigin: BatchTransferQueue?
-        var retryHoldID: UUID?
-        var heldQueues: [BatchTransferQueue] = []
-        @MainActor
-        func endRetryPreparation() {
-            retryOrigin?.endCollectionRetry()
-            if let id = retryHoldID { heldQueues.forEach { $0.releaseRetryHold(id) } }
-        }
-        init(endpoint: FTPEndpoint, remoteRoot: RemotePath, encoding: FTPTextEncoding, credentials: FTPCredentials) {
-            self.endpoint = endpoint; self.remoteRoot = remoteRoot; self.encoding = encoding; self.credentials = credentials
-        }
-        func release() {
-            roots.forEach { $0.endAccess() }; destination?.endAccess()
-            roots = []; sources = [:]; destination = nil
-        }
-    }
-    private var collectionPreparation: CollectionPreparation?
+    private var collectionPreparation: CollectionTransferCoordinator.Preparation? { collectionCoordinator.preparation }
     var hasCollectionCredentials: Bool { collectionPreparation != nil || sessionQueues.contains(where: \.hasCredentials) }
     var collectionTarget: String? {
         guard let context = collectionPreparation else { return nil }
@@ -265,50 +250,48 @@ final class AppModel: ObservableObject {
         return context.destination != nil ? .download : .upload
     }
     let history: TransferHistory
-    let metrics = TransferMetricsMonitor()
-    private var historyObservation: AnyCancellable?
+    let metrics: TransferMetricsMonitor
     private var metricsObservation: AnyCancellable?
-    private var batchObservation: AnyCancellable?
-    private var scanObservation: AnyCancellable?
-    private var retryObservation: AnyCancellable?
     private let client: FTPServing
     private var encoding = FTPTextEncoding.utf8
-    private var directoryRequestID = 0
-    private var uploadRequestID = 0
-    private var draftVersion = 0
+    private var directoryRequestID: Int { connectionCoordinator.generation }
+    private var uploadRequestID: Int {
+        get { singleFileCoordinator.uploadGeneration }
+        set { singleFileCoordinator.uploadGeneration = newValue }
+    }
+    private var draftVersion: Int { connectionCoordinator.draftVersion }
     private var dropGeneration = UUID()
     private var updatingDraft = false
     private var activeCredentials: FTPCredentials?
-    private var directoryCancellation: FTPCancellationToken?
-    private var uploadCancellation: FTPCancellationToken?
-    private struct UploadSnapshot {
-        let id = UUID()
-        let version: Int
-        let endpoint: FTPEndpoint
-        let path: RemotePath
-        let credentials: FTPCredentials
-        let encoding: FTPTextEncoding
-        let file: SelectedLocalFile
-        let local: SelectedLocalFile.Snapshot
+    private var directoryCancellation: FTPCancellationToken? { connectionCoordinator.cancellation }
+    private var uploadCancellation: FTPCancellationToken? {
+        get { singleFileCoordinator.uploadCancellation }
+        set { singleFileCoordinator.uploadCancellation = newValue }
     }
-    private var pendingOverwrite: UploadSnapshot?
-    private var pendingUploadJob: TransferJob?
+    private typealias UploadSnapshot = SingleFileTransferCoordinator.UploadSnapshot
+    private var pendingOverwrite: UploadSnapshot? {
+        get { singleFileCoordinator.pendingOverwrite }
+        set { singleFileCoordinator.pendingOverwrite = newValue }
+    }
+    private var pendingUploadJob: TransferJob? {
+        get { singleFileCoordinator.pendingUploadJob }
+        set { singleFileCoordinator.pendingUploadJob = newValue }
+    }
 
-    private func matches(_ snapshot: UploadSnapshot, cancellation: FTPCancellationToken) async throws -> Bool {
-        guard snapshot.version == draftVersion, snapshot.endpoint == endpoint,
-              snapshot.path == path, snapshot.encoding == encoding,
-              snapshot.file === selectedFile, let credentials = activeCredentials,
-              snapshot.credentials.sameAuthentication(as: credentials) else { return false }
-        return try await snapshot.file.snapshot(cancellation: cancellation) == snapshot.local
+    private func matchesContext(_ snapshot: UploadSnapshot) -> Bool {
+        snapshot.matches(version: draftVersion, endpoint: endpoint, path: path,
+            encoding: encoding, file: selectedFile, credentials: activeCredentials)
+    }
+
+    private func matchesContent(_ snapshot: UploadSnapshot, cancellation: FTPCancellationToken) async throws -> Bool {
+        guard matchesContext(snapshot) else { return false }
+        let local = try await snapshot.file.snapshot(cancellation: cancellation)
+        return matchesContext(snapshot) && local == snapshot.local
     }
 
     private func clearOverwrite(preserveJob: Bool = false) {
-        if !preserveJob, let job = pendingUploadJob {
-            job.finish(.cancelled)
-            history.record(job, target: uploadTarget ?? "", bytes: 0)
-        }
-        pendingUploadJob = nil
-        pendingOverwrite = nil; overwriteTarget = nil; overwriteRequestID = nil
+        singleFileCoordinator.clearOverwrite(preserveJob: preserveJob, history: history, target: uploadTarget ?? "")
+        overwriteTarget = nil; overwriteRequestID = nil
         if uploadState == .awaitingOverwrite { uploadState = .idle }
     }
 
@@ -321,37 +304,47 @@ final class AppModel: ObservableObject {
     func confirmOverwrite(_ id: UUID) {
         guard let snapshot = pendingOverwrite, snapshot.id == id, let job = pendingUploadJob else { return }
         clearOverwrite(preserveJob: true)
+        uploadConnection?.resume()
         startUpload(authorization: snapshot, existingJob: job)
         if !isUploading { snapshot.file.endAccess() }
     }
 
-    init(client: FTPServing = FTPClient(), sites: SiteManager? = nil, history: TransferHistory? = nil, keyAccess: PrivateKeyAccessing = PrivateKeyAccess(), rootScope: LocalSecurityScope = .system) {
+    private let makeDownload: (URL, LocalDownload.Identity?) throws -> LocalDownload
+    private let diagnostics: TransferDiagnostics?
+    private var diagnosticsObservation: AnyCancellable?
+    private var sitesObservation: AnyCancellable?
+
+    init(client: FTPServing = FTPClient(), sites: SiteManager? = nil, history: TransferHistory? = nil, keyAccess: PrivateKeyAccessing = PrivateKeyAccess(), rootScope: LocalSecurityScope = .system, diagnostics: TransferDiagnostics? = nil,
+         makeDownload: ((URL, LocalDownload.Identity?) throws -> LocalDownload)? = nil) {
+        self.makeDownload = makeDownload ?? { try LocalDownload(destination: $0, authorizedIdentity: $1, scope: rootScope) }
+        self.diagnostics = diagnostics
         self.rootScope = rootScope
         self.keyAccess = keyAccess
         self.client = client; self.sites = sites ?? SiteManager()
         let executor = TransferExecutor(); transferExecutor = executor
-        files = FileTransferRunner(client: client, executor: executor)
-        batch = BatchTransferQueue(client: client, executor: executor)
-        retryBatch = BatchTransferQueue(client: client, executor: executor)
-        self.history = history ?? TransferHistory()
-        batch.onFinish = { [weak self] job, target, bytes in
-            if self?.batch.isCollection == false { self?.history.record(job, target: target, bytes: bytes) }
-            if self?.batch.isExecuting == false { self?.metrics.stop() }
+        connectionCoordinator = ConnectionSessionCoordinator(client: client, executor: executor)
+        singleFileCoordinator = SingleFileTransferCoordinator(client: client, executor: executor)
+        let transferHistory = history ?? TransferHistory()
+        self.history = transferHistory
+        let monitor = TransferMetricsMonitor()
+        metrics = monitor
+        collectionCoordinator = CollectionTransferCoordinator(client: client, executor: executor,
+            scope: rootScope, history: transferHistory, metrics: monitor)
+        retryBatch = collectionCoordinator.retryBatch
+        collectionCoordinator.onRetryQueueChange = { [weak self] queue in self?.retryBatch = queue }
+        collectionCoordinator.onChange = { [weak self] in self?.objectWillChange.send() }
+        if let diagnostics {
+            diagnosticsObservation = objectWillChange.sink { diagnostics.record(.notifications) }
         }
-        batch.onHistoryRecord = { [weak self] record in self?.history.record(record) }
-        batch.onStart = { [weak self] total in self?.metrics.reset(total: total) }
-        batch.onProgress = { [weak self] _, bytes, total in self?.metrics.update(bytes: bytes, total: total) ?? false }
-        historyObservation = self.history.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
+        sitesObservation = self.sites.objectWillChange.sink { [weak self] _ in
+            // Only saved-site consumers depend on recovery guards. Do not add unrelated
+            // startup notifications to manual connections or independent queue observers.
+            guard let self, self.selectedSiteID != nil else { return }
+            self.objectWillChange.send()
+        }
+        // TransferPanel and TransferActivityObserver observe history directly. Async
+        // loading/saving must not fan out unrelated startup notifications through AppModel.
         metricsObservation = metrics.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
-        batchObservation = batch.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
-        scanObservation = collectionScan.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
-        retryObservation = retryBatch.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
-        collectionScan.onDiscard = { [weak self] in
-            guard let self else { return }
-            let context = collectionPreparation
-            context?.release(); collectionPreparation = nil
-            context?.endRetryPreparation()
-        }
     }
 
     var isUploading: Bool { uploadState == .checkingTarget || uploadState == .uploading || uploadState == .awaitingCompletion || uploadState == .cancelling }
@@ -398,14 +391,14 @@ final class AppModel: ObservableObject {
         else { cancelOperation(id: id) }
     }
     var canConnect: Bool {
-        canEditConnection && !isPasswordLoading && !isDirectoryLoading
+        canEditConnection && sites.canUseSite(selectedSiteID) && !isPasswordLoading && !isDirectoryLoading
             && !address.trimmingCharacters(in: .whitespaces).isEmpty
     }
     var connectionIdentity: String {
         guard let credentials = activeCredentials, let endpoint else { return transport.title }
         return endpoint.transport.title + (credentials.mode == .anonymous ? " · 匿名访问" : " · 账户：\(credentials.username)" + (credentials.authenticationMethod == .privateKey ? " · 私钥认证" : ""))
     }
-    var canChooseFile: Bool { hasDirectory && !isBusy }
+    var canChooseFile: Bool { hasDirectory && !isBusy && sites.canUseSite(selectedSiteID) }
     var canPrepareCollection: Bool { canChooseFile && uploadState != .awaitingOverwrite }
     var canUpload: Bool { canChooseFile && selectedFile != nil && uploadState != .awaitingOverwrite }
     /// Safe UI context derived only from the effective directory, never a draft.
@@ -490,8 +483,7 @@ final class AppModel: ObservableObject {
 
     private func invalidateConnection() {
         hostTrustRequest = nil; hostTrustVersion = nil; changedHost = nil
-        draftVersion += 1
-        directoryRequestID += 1
+        connectionCoordinator.invalidate()
         endpoint = nil
         path = .root
         entries = []
@@ -530,7 +522,7 @@ final class AppModel: ObservableObject {
         isPasswordLoading = true
         Task {
             do {
-                let saved = try await sites.passwords.password(for: site)
+                let saved = try await sites.password(for: site)
                 guard version == draftVersion, selectedSiteID == site.id else { return }
                 updatingDraft = true; password = saved; updatingDraft = false
                 identityChangedNotice = false
@@ -609,29 +601,25 @@ final class AppModel: ObservableObject {
 
     private func requestDirectory(endpoint requestedEndpoint: FTPEndpoint, path requestedPath: RemotePath,
                                   preferredEncoding: FTPTextEncoding?, credentials: FTPCredentials, resolveInitial: Bool = false) {
+        guard sites.canUseSite(selectedSiteID) else {
+            directoryError = "此站点恢复未完成，未发起网络请求。请先恢复或使用独立手动连接。"
+            return
+        }
         clearOverwrite()
-        directoryRequestID += 1
-        let id = directoryRequestID
+        let request = connectionCoordinator.begin()
+        let id = request.generation
         let policy = encodingPolicy
-        let cancellation = FTPCancellationToken()
-        directoryCancellation = cancellation
+        let cancellation = request.cancellation
         isDirectoryLoading = true
         isDirectoryCancelling = false
         directoryCancelled = false
         directoryError = nil
         Task {
             do {
-                let listing: DirectoryListing
-                let resolvedPath: RemotePath
-                if resolveInitial {
-                    let resolved = try await client.resolveInitialDirectory(endpoint: requestedEndpoint, policy: policy,
-                                                                           credentials: credentials, cancellation: cancellation)
-                    listing = resolved.listing; resolvedPath = resolved.path
-                } else {
-                    listing = try await client.list(endpoint: requestedEndpoint, path: requestedPath, encoding: preferredEncoding, credentials: credentials, cancellation: cancellation)
-                    resolvedPath = requestedPath
-                }
-                try cancellation.checkCancellation()
+                let resolved = try await connectionCoordinator.list(endpoint: requestedEndpoint, path: requestedPath,
+                    preferredEncoding: preferredEncoding, policy: policy, credentials: credentials,
+                    resolveInitial: resolveInitial, cancellation: cancellation)
+                let listing = resolved.listing, resolvedPath = resolved.path
                 guard id == directoryRequestID else { return }
                 endpoint = requestedEndpoint
                 activeCredentials = credentials
@@ -640,12 +628,12 @@ final class AppModel: ObservableObject {
                 encoding = listing.encoding
                 hasDirectory = true
                 isDirectoryLoading = false
-                directoryCancellation = nil
+                connectionCoordinator.finish(id)
             } catch {
                 guard id == directoryRequestID else { return }
                 isDirectoryLoading = false
                 isDirectoryCancelling = false
-                directoryCancellation = nil
+                connectionCoordinator.finish(id)
                 if credentials.authenticationMethod == .privateKey,
                    !(error is HostTrustError) {
                     activeCredentials = nil
@@ -715,7 +703,7 @@ final class AppModel: ObservableObject {
         guard canChooseFile else { return }
         selectionError = nil
         do {
-            let file = try SelectedLocalFile(url: url)
+            let file = try SelectedLocalFile(url: url, diagnostics: diagnostics)
             clearFile()
             selectedFile = file
             resetUpload()
@@ -737,6 +725,7 @@ final class AppModel: ObservableObject {
         let targetPath = path
         let targetEncoding = encoding
         uploadTarget = pendingTarget
+        uploadTrafficOverflow = false
         sent = 0
         total = file.size
         metrics.reset(total: total)
@@ -745,12 +734,17 @@ final class AppModel: ObservableObject {
                                             encoding: targetEncoding, credentials: credentials, localURL: file.url,
                                             cancellation: cancellation)
         let version = draftVersion
+        let connection = singleFileCoordinator.uploadSession(endpoint: endpoint, credentials: credentials,
+            continuing: existingJob != nil)
+        let files = FileTransferRunner(client: connection, executor: transferExecutor)
         do {
             try file.beginAccessAndValidate()
             _ = try endpoint.fileURL(targetPath, name: file.name, encoding: targetEncoding)
         } catch {
+            singleFileCoordinator.closeUpload(connection)
             file.endAccess()
             job.finish(.failed(credentials.redacting(error.localizedDescription)))
+            job.byteCounter.finish()
             history.record(job, target: uploadTarget ?? "", bytes: 0); metrics.stop()
             uploadState = .failed(credentials.redacting(error.localizedDescription))
             return
@@ -760,66 +754,86 @@ final class AppModel: ObservableObject {
         let id = uploadRequestID
         uploadCancellation = cancellation
         uploadState = .checkingTarget
+        let progressGeneration = job.id, historyTarget = uploadTarget ?? "", expectedTotal = file.size
+        let progressBox = TransferProgressMailbox(generation: progressGeneration, contentSent: { [weak self] in
+            guard let self, self.uploadRequestID == id, self.isUploading, !cancellation.isCancelled else { return }
+            self.uploadState = .awaitingCompletion
+        }, deliver: { [weak self] sample in
+            guard let self, self.uploadRequestID == id, self.isUploading, !cancellation.isCancelled else { return }
+            _ = self.metrics.update(bytes: sample.bytes, total: sample.total, force: true)
+            self.sent = max(self.sent, sample.bytes)
+            if sample.total >= 0 { self.total = sample.total }
+        })
         Task { [self, file] in
             defer {
+                progressBox.stop()
+                if pendingUploadJob !== job {
+                    connection.close()
+                    singleFileCoordinator.closeUpload(connection)
+                }
                 file.endAccess(); if id == uploadRequestID { uploadCancellation = nil }
-                if job.outcome != nil { history.record(job, target: uploadTarget ?? "", bytes: metrics.bytes); metrics.stop() }
+                if job.outcome != nil {
+                    job.byteCounter.finish()
+                    if id == uploadRequestID {
+                        sent = job.byteCounter.bytes
+                        uploadTrafficOverflow = job.byteCounter.hasOverflow
+                        metrics.finish(bytes: sent, total: expectedTotal)
+                    }
+                    history.record(job, target: historyTarget, bytes: job.byteCounter.bytes)
+                } else { metrics.stop() }
             }
             do {
                 let local = try await file.snapshot(cancellation: cancellation)
                 try cancellation.checkCancellation()
                 let snapshot = UploadSnapshot(version: version, endpoint: endpoint, path: targetPath,
                                               credentials: credentials, encoding: targetEncoding, file: file, local: local)
-                if let authorization, !(try await matches(authorization, cancellation: cancellation)) {
+                if let authorization, !matchesContext(authorization) || local != authorization.local {
                     job.finish(.cancelled)
-                    uploadState = .idle
-                    // A changed source requires a fresh target check, never the old authorization.
-                    Task { self.upload() }
+                    uploadState = .cancelled
+                    selectionError = "来源或上传上下文已变化，旧覆盖授权已取消。请重新点击上传并核对目标。"
                     return
                 }
                 if authorization == nil {
-                    let existing = try await client.checkUploadTarget(endpoint: endpoint, path: targetPath, name: file.name,
+                    let existing = try await connection.checkUploadTarget(endpoint: endpoint, path: targetPath, name: file.name,
                                                                     encoding: targetEncoding, credentials: credentials, cancellation: cancellation)
                     try cancellation.checkCancellation()
                     guard id == uploadRequestID else { return }
-                    guard try await matches(snapshot, cancellation: cancellation) else { throw FTPError.localFile("文件在目标检查期间发生变化，请重新选择或上传。") }
+                    guard matchesContext(snapshot) else { throw FTPError.localFile("目标检查期间上传上下文已变化，请重新选择或上传。") }
                     if let existing {
+                        guard try await matchesContent(snapshot, cancellation: cancellation) else { throw FTPError.localFile("文件在目标检查期间发生变化，请重新选择或上传。") }
                         if existing.kind != .regularFile { throw FTPError.uploadTargetConflict }
                         pendingOverwrite = snapshot
                         pendingUploadJob = job
                         metrics.stop()
                         overwriteRequestID = snapshot.id
                         overwriteTarget = uploadTarget
+                        connection.pause()
                         uploadState = .awaitingOverwrite
                         return
                     }
                 } else {
-                    guard let authorization, try await matches(authorization, cancellation: cancellation) else {
+                    guard let authorization, matchesContext(authorization) else {
                         throw FTPError.localFile("本次覆盖授权已失效，请重新检查目标。")
                     }
                 }
                 uploadState = .uploading
                 try await files.run(job, preparing: {
-                    job.uploadSource = try await file.verifiedSource(matching: authorization?.local ?? local, cancellation: cancellation)
-                }, progress: { [weak self] sent, total in
-                    Task { @MainActor [weak self] in
-                        guard let self, self.uploadRequestID == id, self.isUploading, !cancellation.isCancelled else { return }
-                        let nextSent = max(0, sent)
-                        let nextTotal = max(0, total)
-                        let nextState: UploadState = total == 0 || sent >= total ? .awaitingCompletion : .uploading
-                        guard self.sent != nextSent || self.total != nextTotal || self.uploadState != nextState else { return }
-                        if self.metrics.update(bytes: nextSent, total: nextTotal) {
-                            self.sent = nextSent; self.total = nextTotal
-                        }
-                        self.uploadState = nextState
-                    }
+                    let approved = authorization ?? snapshot
+                    guard matchesContext(approved) else { throw FTPError.localFile("发送前上传上下文已变化。") }
+                    job.uploadSource = try await file.verifiedSource(matching: approved.local, cancellation: cancellation)
+                    guard matchesContext(approved) else { throw FTPError.localFile("最终内容核对期间上传上下文已变化。") }
+                }, progress: { bytes, _ in
+                    progressBox.submit(bytes: bytes, total: expectedTotal, generation: progressGeneration)
+                    if bytes >= expectedTotal { progressBox.signalContentSent() }
                 })
                 try cancellation.checkCancellation()
                 guard id == uploadRequestID else { return }
+                connection.close(); file.endAccess()
                 sent = total
                 uploadState = .succeeded
                 refresh()
             } catch {
+                connection.close(); file.endAccess()
                 job.finish(cancellation.isCancelled || error is CancellationError ? .cancelled : .failed(credentials.redacting(error.localizedDescription)))
                 guard id == uploadRequestID else { return }
                 if case HostTrustError.changed(let identity) = error { changedHost = identity }
@@ -850,23 +864,8 @@ final class AppModel: ObservableObject {
     func prepareUploadCollection(_ urls: [URL]) -> Bool {
         guard canPrepareCollection, let endpoint,
               !urls.isEmpty, urls.count <= TransferPlan.maximumNodes, let credentials = newCollectionCredentials() else { return false }
-        let context = CollectionPreparation(endpoint: endpoint, remoteRoot: path, encoding: encoding, credentials: credentials)
-        collectionPreparation = context
-        return collectionScan.start(operation: { [self] token in
-            for url in urls {
-                try token.checkCancellation()
-                context.roots.append(try LocalSourceRoot(url: url, scope: rootScope))
-            }
-            let plan = try await LocalTransferScanner().scan(roots: context.roots, destination: context.remoteRoot,
-                encoding: context.encoding, cancellation: token, discovered: { [weak self] count in
-                    Task { @MainActor in self?.collectionScan.discovered(count, cancellationID: token.id) }
-                })
-            try token.checkCancellation()
-            context.sources = Dictionary(uniqueKeysWithValues: zip(plan.roots.map(\.id), context.roots))
-            guard plan.canStart else { return plan }
-            return try await TransferRetryPlanner().inspectTargets(plan, client: client, endpoint: context.endpoint,
-                credentials: context.credentials, destination: nil, cancellation: token)
-        }, redact: { credentials.redacting($0) })
+        return collectionCoordinator.prepareUpload(urls, endpoint: endpoint, path: path,
+            encoding: encoding, credentials: credentials)
     }
 
     @discardableResult
@@ -878,20 +877,8 @@ final class AppModel: ObservableObject {
         do {
             selections = try selected.map { .init(entry: $0, path: try path.appending(name: $0.name, bytes: $0.rawName), encoding: encoding) }
         } catch { selectionError = credentials.redacting(error.localizedDescription); return false }
-        let context = CollectionPreparation(endpoint: endpoint, remoteRoot: path, encoding: encoding, credentials: credentials)
-        collectionPreparation = context
-        return collectionScan.start(operation: { [self] token in
-            try token.checkCancellation()
-            let root = try LocalDestinationRoot(url: destination, scope: rootScope)
-            context.destination = root
-            let plan = try await RemoteTransferScanner(client: client).scan(endpoint: context.endpoint, selections: selections,
-                destination: root, credentials: context.credentials, cancellation: token, discovered: { [weak self] count in
-                    Task { @MainActor in self?.collectionScan.discovered(count, cancellationID: token.id) }
-                })
-            guard plan.canStart else { return plan }
-            return try await TransferRetryPlanner().inspectTargets(plan, client: client, endpoint: context.endpoint,
-                credentials: context.credentials, destination: root, cancellation: token)
-        }, redact: { credentials.redacting($0) })
+        return collectionCoordinator.prepareDownload(selections, to: destination, endpoint: endpoint,
+            path: path, encoding: encoding, credentials: credentials)
     }
 
     @discardableResult
@@ -956,92 +943,15 @@ final class AppModel: ObservableObject {
     @discardableResult
     func prepareCollectionRetry(itemID: UUID? = nil, batchID: UUID? = nil) -> Bool {
         guard canPrepareCollectionRetry(itemID: itemID, batchID: batchID),
-              let origin = retryOrigin(itemID: itemID, batchID: batchID),
-              let request = origin.beginCollectionRetry(itemID: itemID) else { return false }
-        let credentials: FTPCredentials
-        if let fixed = request.fixedCredentials { credentials = fixed }
-        else {
-            // Finished plans retain targets, not authentication. Never send old targets to a different server.
-            guard endpoint == request.endpoint, let current = newCollectionCredentials() else {
-                origin.endCollectionRetry(); return false
-            }
-            credentials = current
-        }
-        let context = CollectionPreparation(endpoint: request.endpoint, remoteRoot: request.remoteRoot,
-            encoding: request.encoding, credentials: credentials)
-        context.isRetry = true; context.retryOrigin = origin
-        let holdID = UUID(); context.retryHoldID = holdID
-        context.heldQueues = sessionQueues.filter { $0 !== origin && $0.state == .paused }
-        context.heldQueues.forEach { $0.holdForRetry(holdID) }
-        collectionPreparation = context
-        let started = collectionScan.start(operation: { [self] token in
-            let plan = TransferRetryPlanner.remap(request.plan)
-            if plan.direction == .upload {
-                for root in plan.roots {
-                    try token.checkCancellation()
-                    guard case .local(let url) = root.source else { throw FTPError.invalidName }
-                    let access = try LocalSourceRoot(url: url, scope: rootScope)
-                    context.roots.append(access); context.sources[root.id] = access
-                    guard access.identity.kind == root.kind else { throw FTPError.localFile("重试来源根类型变化。") }
-                }
-                let result = try await TransferRetryPlanner().upload(plan, sources: context.sources, cancellation: token)
-                return try await TransferRetryPlanner().inspectTargets(result, client: client, endpoint: context.endpoint,
-                    credentials: context.credentials, destination: nil, cancellation: token)
-            }
-            guard let url = request.destinationURL else { throw FTPError.localFile("重试目的根丢失。") }
-            let destination = try LocalDestinationRoot(url: url, scope: rootScope)
-            context.destination = destination
-            let lease = try destination.lease()
-            defer { withExtendedLifetime(lease) {} }
-            let result = try await TransferRetryPlanner().download(plan, client: client, endpoint: context.endpoint,
-                credentials: context.credentials, cancellation: token)
-            let checked = try await TransferRetryPlanner().inspectTargets(result, client: client, endpoint: context.endpoint,
-                credentials: context.credentials, destination: destination, cancellation: token)
-            try destination.validateIdentity()
-            return checked
-        }, redact: { credentials.redacting($0) })
-        if !started {
-            context.release(); collectionPreparation = nil; context.endRetryPreparation()
-        }
-        return started
+              let origin = retryOrigin(itemID: itemID, batchID: batchID) else { return false }
+        return collectionCoordinator.prepareRetry(origin: origin, itemID: itemID,
+            endpoint: endpoint, currentCredentials: newCollectionCredentials)
     }
 
     @discardableResult
     func confirmCollection(_ planID: UUID, policy: TransferConflictPolicy = .ask) -> Bool {
-        guard collectionScan.phase == .preview, let plan = collectionScan.plan, plan.id == planID,
-              plan.canStart, let context = collectionPreparation else { return false }
-        let queue = context.isRetry ? BatchTransferQueue(client: client, executor: transferExecutor) : batch
-        guard !queue.isLocked, !context.isRetry || context.retryOrigin?.retryPending == true else { return false }
-        do {
-            try queue.prepare(plan: plan, endpoint: context.endpoint, remoteRoot: context.remoteRoot,
-                encoding: context.encoding, credentials: context.credentials, sources: context.sources, destination: context.destination)
-        } catch { selectionError = context.credentials.redacting(error.localizedDescription); return false }
-        guard queue.chooseConflictPolicy(policy, planID: planID), collectionScan.consume(planID: planID) else { return false }
-        collectionPreparation = nil // Queue now owns roots and the fixed authentication context.
-        if context.isRetry {
-            let origin = context.retryOrigin!, holdID = context.retryHoldID!, held = context.heldQueues
-            origin.acceptCollectionRetry()
-            retryBatch = queue; retryBatches.append(queue)
-            retryObservation = queue.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
-            queue.onHistoryRecord = { [weak self] record in self?.history.record(record) }
-            queue.onStart = { [weak self] total in self?.metrics.reset(total: total) }
-            queue.onProgress = { [weak self] _, bytes, total in self?.metrics.update(bytes: bytes, total: total) ?? false }
-            queue.onFinish = { [weak self] _, _, _ in self?.metrics.stop() }
-            queue.onEnd = { [weak self, weak queue] in
-                origin.endCollectionRetry()
-                held.forEach { $0.releaseRetryHold(holdID) }
-                if origin !== self?.batch, origin.state == .paused, self?.retryBatch === queue {
-                    self?.retryBatch = origin
-                    self?.retryObservation = origin.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
-                }
-            }
-        }
-        else {
-            retryBatches = []; retryObservation = nil
-            retryBatch = BatchTransferQueue(client: client, executor: transferExecutor)
-        }
-        queue.startOrContinue()
-        return true
+        do { return try collectionCoordinator.confirm(planID, policy: policy) }
+        catch { selectionError = error.localizedDescription; return false }
     }
 
     func prepareBatch(_ urls: [URL]) {
@@ -1086,7 +996,7 @@ final class AppModel: ObservableObject {
         let sink: LocalDownload
         do {
             remote = try path.appending(name: entry.name, bytes: entry.rawName)
-            sink = try LocalDownload(destination: destination, authorizedIdentity: authorizedIdentity)
+            sink = try makeDownload(destination, authorizedIdentity)
         } catch { downloadState = .failed(error.localizedDescription); return }
         let token = FTPCancellationToken()
         downloadCancellation = token
@@ -1094,39 +1004,58 @@ final class AppModel: ObservableObject {
         downloadConfirmationID = nil
         downloadName = entry.name
         downloadTarget = endpoint.display + remote.display + " → " + destination.path
+        downloadTrafficOverflow = false
         downloadBytes = 0; downloadTotal = entry.size ?? -1; downloadState = .uploading
         let job = TransferJob(direction: .download, endpoint: endpoint, path: remote, encoding: encoding,
                               credentials: credentials, localURL: destination, cancellation: token, name: entry.name)
         metrics.reset(total: downloadTotal)
+        let historyTarget = downloadTarget ?? "", progressGeneration = job.id, knownEmpty = entry.size == 0
+        let progressBox = TransferProgressMailbox(generation: progressGeneration, contentSent: { [weak self] in
+            guard let self, self.downloadCancellation === token, !token.isCancelled,
+                  [.uploading, .awaitingCompletion].contains(self.downloadState) else { return }
+            self.downloadState = .awaitingCompletion
+        }, deliver: { [weak self] sample in
+            guard let self, self.downloadCancellation === token, !token.isCancelled,
+                  [.uploading, .awaitingCompletion].contains(self.downloadState) else { return }
+            _ = self.metrics.update(bytes: sample.bytes, total: sample.total, force: true)
+            self.downloadBytes = max(self.downloadBytes, sample.bytes)
+            if sample.total >= 0 { self.downloadTotal = sample.total }
+        })
+        let connection = singleFileCoordinator.downloadSession(endpoint: endpoint, credentials: credentials)
+        let files = FileTransferRunner(client: connection, executor: transferExecutor)
         Task {
-            defer { history.record(job, target: downloadTarget ?? "", bytes: sink.byteCount); metrics.stop() }
+            defer {
+                singleFileCoordinator.closeDownload(connection)
+                progressBox.stop(); job.byteCounter.finish()
+                downloadBytes = job.byteCounter.bytes
+                downloadTrafficOverflow = job.byteCounter.hasOverflow
+                metrics.finish(bytes: downloadBytes, total: downloadTotal)
+                history.record(job, target: historyTarget, bytes: job.byteCounter.bytes)
+            }
             do {
-                try await files.run(job, receive: sink.receive, finalizing: {
-                    try sink.closeFile()
-                    // A newly created target needs a separate confirmation after reception.
-                    do { try sink.commit() }
-                    catch LocalDownload.CommitError.confirmationRequired {
-                        pendingDownload = sink; downloadConfirmationID = job.id
+                _ = try await files.runDownload(job, sink: sink, confirmTarget: { target, identity in
+                    try token.checkCancellation()
+                    guard downloadCancellation === token, job.outcome == nil else { throw CancellationError() }
+                    let decisionID = UUID()
+                    connection.pause()
+                    return try await withCheckedThrowingContinuation { continuation in
+                        singleFileCoordinator.waitForDownloadDecision(id: decisionID, job: job, target: target,
+                            identity: identity, continuation: continuation)
+                        downloadConfirmationID = decisionID
                         downloadState = .awaitingOverwrite
-                        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                            downloadCommitContinuation = continuation
-                        }
                     }
-                }, progress: { [weak self] bytes, total in
-                    Task { @MainActor [weak self] in
-                        guard let self, self.downloadCancellation === token, !token.isCancelled, [.uploading, .awaitingCompletion].contains(self.downloadState) else { return }
-                        if self.metrics.update(bytes: bytes, total: total) {
-                            self.downloadBytes = max(self.downloadBytes, bytes)
-                            if total >= 0 { self.downloadTotal = total }
-                        }
-                        self.downloadState = total >= 0 && bytes >= total ? .awaitingCompletion : .uploading
-                    }
+                }, cleanupFailure: { error in
+                    downloadCleanupError = credentials.redacting(error.localizedDescription)
+                }, progress: { bytes, total in
+                    progressBox.submit(bytes: bytes, total: total, generation: progressGeneration)
+                    if (total > 0 || (total == 0 && knownEmpty)) && bytes >= total { progressBox.signalContentSent() }
                 })
+                connection.close()
                 downloadBytes = sink.byteCount
                 downloadState = .succeeded; downloadCancellation = nil
             } catch {
-                var message = credentials.redacting(error.localizedDescription)
-                do { try sink.cleanUp() } catch { downloadCleanupError = error.localizedDescription; message += " " + error.localizedDescription }
+                connection.close()
+                let message = credentials.redacting(error.localizedDescription)
                 if token.isCancelled || error is CancellationError { downloadState = .cancelled }
                 else { downloadState = .failed(message) }
                 if case HostTrustError.changed(let identity) = error { changedHost = identity }
@@ -1136,19 +1065,14 @@ final class AppModel: ObservableObject {
     }
 
     func confirmDownloadCommit(_ id: UUID) {
-        guard downloadConfirmationID == id, let sink = pendingDownload,
-              let continuation = downloadCommitContinuation else { return }
-        downloadCommitContinuation = nil; pendingDownload = nil; downloadConfirmationID = nil
-        do { try sink.authorizeCurrentTarget(); try sink.commit(); continuation.resume() }
-        catch { continuation.resume(throwing: error) }
+        guard downloadConfirmationID == id, singleFileCoordinator.confirmDownload(id) else { return }
+        downloadConfirmationID = nil
     }
 
-    func cancelDownloadConfirmation() {
-        guard let continuation = downloadCommitContinuation else { return }
-        downloadCancellation?.cancel()
-        downloadCommitContinuation = nil; pendingDownload = nil; downloadConfirmationID = nil
+    func cancelDownloadConfirmation(_ id: UUID? = nil) {
+        guard singleFileCoordinator.cancelDownloadDecision(id) else { return }
+        downloadConfirmationID = nil
         downloadState = .cancelling
-        continuation.resume(throwing: CancellationError())
     }
 
     private func clearFile() {
@@ -1161,6 +1085,7 @@ final class AppModel: ObservableObject {
         uploadState = .idle
         clearOverwrite()
         uploadTarget = nil
+        uploadTrafficOverflow = false
         sent = 0
         total = 0
     }

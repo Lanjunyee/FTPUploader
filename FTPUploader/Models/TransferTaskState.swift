@@ -28,6 +28,7 @@ final class TransferTaskState: Identifiable {
     let id: UUID
     let kind: TransferTaskKind
     private(set) var result: TransferTaskResult?
+    let historyAdmission = TransferHistoryAdmission()
 
     init(id: UUID = UUID(), kind: TransferTaskKind) {
         self.id = id; self.kind = kind
@@ -56,26 +57,66 @@ struct TransferSummary {
     }
     let entries: [Entry]
     let isFinished: Bool
-    var fileCount: Int { entries.filter { $0.kind == .file }.count }
-    var directoryCount: Int { entries.count - fileCount }
-    var completedFiles: Int { entries.filter { $0.kind == .file && $0.result != nil }.count }
-    var completedDirectories: Int { entries.filter { $0.kind == .directory && $0.result != nil }.count }
-    var succeeded: Int { entries.filter { $0.result == .succeeded }.count }
-    var failed: Int { entries.filter { if case .failed = $0.result { return true }; return false }.count }
-    var cancelled: Int { entries.filter { $0.result == .cancelled }.count }
-    var skipped: Int { entries.filter { if case .skipped = $0.result { return true }; return false }.count }
-    var blocked: Int { entries.filter { if case .blocked = $0.result { return true }; return false }.count }
-    var totalSize: Int64? { Self.sum(entries.filter { $0.kind == .file }.map(\.size)) }
-    var successfulBytes: Int64? {
-        Self.sum(entries.filter { $0.kind == .file && $0.result == .succeeded }.map { Optional($0.successfulBytes) })
-    }
+    let fileCount: Int
+    let directoryCount: Int
+    let completedFiles: Int
+    let completedDirectories: Int
+    let succeeded: Int
+    let failed: Int
+    let cancelled: Int
+    let skipped: Int
+    let blocked: Int
+    let totalSize: Int64?
+    let successfulBytes: Int64?
     /// Original-plan credit uses size hints, not retry traffic or active/uncommitted bytes.
-    var plannedSuccessfulBytes: Int64? {
-        Self.sum(entries.filter { $0.kind == .file && $0.result == .succeeded }.map(\.size))
+    let plannedSuccessfulBytes: Int64?
+    let actualBytes: Int64?
+
+    init(entries: [Entry], isFinished: Bool, diagnostics: TransferDiagnostics? = nil) {
+        self.init(projecting: entries, isFinished: isFinished, diagnostics: diagnostics)
     }
-    var actualBytes: Int64? {
-        guard !entries.contains(where: \.trafficOverflow) else { return nil }
-        return Self.sum(entries.map { Optional($0.actualBytes) })
+    /// A lazy queue projection can produce entries and aggregate them in the same traversal.
+    init<S: Sequence>(projecting source: S, isFinished: Bool, diagnostics: TransferDiagnostics? = nil) where S.Element == Entry {
+        var entries: [Entry] = []
+        var files = 0, directories = 0, completedFiles = 0, completedDirectories = 0
+        var succeeded = 0, failed = 0, cancelled = 0, skipped = 0, blocked = 0
+        var total: Int64? = 0, successful: Int64? = 0, credit: Int64? = 0, actual: Int64? = 0
+        for entry in source {
+            entries.append(entry)
+            if entry.kind == .file {
+                files += 1
+                if entry.result != nil { completedFiles += 1 }
+                Self.add(entry.size, to: &total)
+                if entry.result == .succeeded {
+                    Self.add(entry.successfulBytes, to: &successful)
+                    Self.add(entry.size, to: &credit)
+                }
+            } else {
+                directories += 1
+                if entry.result != nil { completedDirectories += 1 }
+            }
+            switch entry.result {
+            case .succeeded: succeeded += 1
+            case .failed: failed += 1
+            case .cancelled: cancelled += 1
+            case .skipped: skipped += 1
+            case .blocked: blocked += 1
+            case nil: break
+            }
+            if entry.trafficOverflow { actual = nil } else { Self.add(entry.actualBytes, to: &actual) }
+        }
+        self.entries = entries; self.isFinished = isFinished
+        fileCount = files; directoryCount = directories
+        self.completedFiles = completedFiles; self.completedDirectories = completedDirectories
+        self.succeeded = succeeded; self.failed = failed; self.cancelled = cancelled; self.skipped = skipped; self.blocked = blocked
+        totalSize = total; successfulBytes = successful; plannedSuccessfulBytes = credit; actualBytes = actual
+        diagnostics?.record(.summarySnapshots)
+        diagnostics?.record(.summaryNodes, count: Int64(entries.count))
+    }
+    private static func add(_ value: Int64?, to sum: inout Int64?) {
+        guard let current = sum, let value, value >= 0 else { sum = nil; return }
+        let next = current.addingReportingOverflow(value)
+        sum = next.overflow ? nil : next.partialValue
     }
     var allSuccessful: Bool { isFinished && !entries.isEmpty && succeeded == entries.count }
     /// A success fraction, never a claim that terminal failures/skips are 100% success.
@@ -102,8 +143,12 @@ struct TransferSummary {
 struct TransferSessionSummary {
     let original: TransferSummary
     let retries: [TransferSummary]
+    let actualBytes: Int64?
+    init(original: TransferSummary, retries: [TransferSummary]) {
+        self.original = original; self.retries = retries
+        actualBytes = TransferSummary.sum(([original] + retries).map(\.actualBytes))
+    }
     var allResults: [TransferSummary.Entry] { original.entries + retries.flatMap(\.entries) }
-    var actualBytes: Int64? { TransferSummary.sum(([original] + retries).map(\.actualBytes)) }
     // New attempts do not rewrite the original plan's completion credit or outcomes.
     var successfulBytes: Int64? { original.successfulBytes }
     var allSuccessful: Bool { original.allSuccessful }

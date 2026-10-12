@@ -5,9 +5,11 @@ final class FTPCancellationToken: @unchecked Sendable {
     let id = UUID()
     private let lock = NSLock()
     private var cancelled = false
+    private let parent: FTPCancellationToken?
+    init(parent: FTPCancellationToken? = nil) { self.parent = parent }
     var isCancelled: Bool {
-        lock.lock(); defer { lock.unlock() }
-        return cancelled
+        lock.lock(); let ownCancellation = cancelled; lock.unlock()
+        return ownCancellation || (parent?.isCancelled ?? false)
     }
     func cancel() {
         lock.lock(); defer { lock.unlock() }
@@ -30,6 +32,8 @@ protocol FTPServing {
     func checkUploadTarget(endpoint: FTPEndpoint, path: RemotePath, name: String, encoding: FTPTextEncoding,
                            credentials: FTPCredentials, cancellation: FTPCancellationToken) async throws -> RemoteEntry?
     func list(endpoint: FTPEndpoint, path: RemotePath, encoding: FTPTextEncoding?, credentials: FTPCredentials, cancellation: FTPCancellationToken) async throws -> DirectoryListing
+    func listPreviewTargets(endpoint: FTPEndpoint, path: RemotePath, encoding: FTPTextEncoding,
+                            credentials: FTPCredentials, cancellation: FTPCancellationToken) async throws -> DirectoryListing
     func upload(endpoint: FTPEndpoint, path: RemotePath, file: URL, encoding: FTPTextEncoding, credentials: FTPCredentials, cancellation: FTPCancellationToken,
                 progress: @escaping (Int64, Int64) -> Void) async throws
     func upload(endpoint: FTPEndpoint, path: RemotePath, source: SelectedLocalFile.VerifiedSource,
@@ -38,6 +42,11 @@ protocol FTPServing {
 }
 
 extension FTPServing {
+    /// Complete read-only listing for a preview phase; execution never uses this cache boundary.
+    func listPreviewTargets(endpoint: FTPEndpoint, path: RemotePath, encoding: FTPTextEncoding,
+                            credentials: FTPCredentials, cancellation: FTPCancellationToken) async throws -> DirectoryListing {
+        try await list(endpoint: endpoint, path: path, encoding: encoding, credentials: credentials, cancellation: cancellation)
+    }
     /// Fail closed for backends that have not implemented descriptor-based uploads.
     func upload(endpoint: FTPEndpoint, path: RemotePath, source: SelectedLocalFile.VerifiedSource,
                 encoding: FTPTextEncoding, credentials: FTPCredentials, cancellation: FTPCancellationToken,
@@ -54,7 +63,9 @@ extension FTPServing {
             let listing = try await list(endpoint: endpoint, path: parent, encoding: encoding,
                                          credentials: credentials, cancellation: cancellation)
             try cancellation.checkCancellation()
-            return listing.entries.first { $0.rawName == name.bytes }
+            let entry = try listing.indexed(names: [name.bytes], cancellation: cancellation)[name.bytes]
+            guard entry == nil || entry?.name == name.name else { throw FTPError.invalidName }
+            return entry
         }
         if let existing = try await check() {
             guard existing.kind == .directory else { throw FTPError.uploadTargetConflict }
@@ -70,8 +81,16 @@ extension FTPServing {
             let creationError = error
             try cancellation.checkCancellation()
             if creationError is CancellationError { throw CancellationError() }
+            // Only an owner-local backend-classified failure can open the approved fresh read-only scope.
+            let existing: RemoteEntry?
+            if let owner = self as? DirectoryFailureRechecking {
+                let listing = try await owner.recheckDirectory(endpoint: endpoint, parent: parent, encoding: encoding,
+                    credentials: credentials, cancellation: cancellation, after: creationError)
+                existing = try listing.indexed(names: [name.bytes], cancellation: cancellation)[name.bytes]
+                guard existing == nil || existing?.name == name.name else { throw FTPError.invalidName }
+            } else { existing = try await check() }
             // Do not change identity, delete, rename, chmod, or implicitly retry creation.
-            if let existing = try await check() {
+            if let existing {
                 guard existing.kind == .directory else { throw FTPError.uploadTargetConflict }
                 return .verifiedAfterError
             }
@@ -156,7 +175,9 @@ extension FTPServing {
         try RemotePath.validateName(bytes)
         let listing = try await list(endpoint: endpoint, path: path, encoding: encoding, credentials: credentials, cancellation: cancellation)
         try cancellation.checkCancellation()
-        return listing.entries.first { $0.rawName == bytes }
+        let entry = try listing.indexed(names: [bytes], cancellation: cancellation)[bytes]
+        guard entry == nil || entry?.name == name else { throw FTPError.invalidName }
+        return entry
     }
 
     func list(endpoint: FTPEndpoint, path: RemotePath, encoding: FTPTextEncoding? = nil,
@@ -185,6 +206,31 @@ final class FTPClient: FTPServing, @unchecked Sendable {
     private let sftp: SFTPClient
     private let caFile: String?
     private let tlsAvailable: () -> Bool
+    private var curlDriver: CurlTransportDriver?
+
+    private init(copying client: FTPClient, driver: CurlTransportDriver) {
+        options = client.options; sftp = client.sftp; caFile = client.caFile
+        tlsAvailable = client.tlsAvailable; curlDriver = driver
+    }
+    @MainActor
+    func makeCurlSession(endpoint: FTPEndpoint, credentials: FTPCredentials, executor: TransferExecutor,
+                         cancellation: FTPCancellationToken = .init()) async throws -> ManagedCurlTransferSession {
+        try checkCapability(endpoint)
+        guard credentials.authenticationMethod == .password else { throw FTPError.security("FTP/FTPS 会话需要账户密码认证。") }
+        try cancellation.checkCancellation()
+        let ca: TransportCAFile?
+        if endpoint.transport.requiresTLS, let caFile {
+            ca = try await Task.detached(priority: .userInitiated) {
+                try TransportCAFile(url: URL(fileURLWithPath: caFile), cancellation: cancellation)
+            }.value
+        } else { ca = nil }
+        try cancellation.checkCancellation()
+        let configuration = TransportConfiguration(connectTimeout: Int(options.connect_timeout), responseTimeout: Int(options.response_timeout),
+            stallTimeout: Int(options.stall_timeout), ca: ca)
+        let driver = try CurlTransportDriver(ca: ca)
+        return ManagedCurlTransferSession(endpoint: endpoint, credentials: credentials, backend: FTPClient(copying: self, driver: driver),
+            driver: driver, configuration: configuration, executor: executor)
+    }
 
     init(connectTimeout: Int = 15, responseTimeout: Int = 60, stallTimeout: Int = 60, caFile: String? = nil, tlsAvailable: @escaping () -> Bool = { ftps_available() != 0 }, trust: HostTrustStoring = HostTrustStore()) {
         self.sftp = SFTPClient(trust: trust, connectTimeout: connectTimeout, responseTimeout: responseTimeout, stallTimeout: stallTimeout)
@@ -192,6 +238,10 @@ final class FTPClient: FTPServing, @unchecked Sendable {
         options = FTPOptions(connect_timeout: connectTimeout, response_timeout: responseTimeout, stall_timeout: stallTimeout, tls_mode: 0, ca_file: nil)
     }
 
+    @MainActor
+    func makeSSHSession(endpoint: FTPEndpoint, credentials: FTPCredentials, executor: TransferExecutor) throws -> ManagedSSHTransferSession {
+        try sftp.makeSession(endpoint: endpoint, credentials: credentials, executor: executor)
+    }
     func trustHost(_ identity: SSHHostIdentity) throws { try sftp.trustHost(identity) }
     func resetHost(_ identity: SSHHostIdentity) throws { try sftp.resetHost(identity) }
 
@@ -231,6 +281,9 @@ final class FTPClient: FTPServing, @unchecked Sendable {
                         data = try fetch(endpoint: endpoint, url: url, method: "MLSD", credentials: credentials, cancellation: cancellation)
                         machineReadable = true
                     } catch let error as FTPError where [500, 502, 504].contains(error.responseCode ?? 0) {
+                        // Approved read-only compatibility: close the failed cache, recheck
+                        // fixed CA, then perform LIST once on a fresh connection. Never redo MLSD.
+                        try curlDriver?.replaceForUnsupportedMLSD(cancellation: cancellation)
                         data = try fetch(endpoint: endpoint, url: url, method: "LIST", credentials: credentials, cancellation: cancellation)
                         machineReadable = false
                     }
@@ -248,10 +301,11 @@ final class FTPClient: FTPServing, @unchecked Sendable {
         try cancellation.checkCancellation()
         let context = TransferContext(cancellation: cancellation)
         let pointer = Unmanaged.passUnretained(context).toOpaque()
+        let session = try curlDriver?.borrow()
         let result = withOptions(endpoint) { options in
             credentials.username.withCString { user in
             credentials.password.withCString { password in
-                ftp_list(url, method, user, password, options, { bytes, count, pointer in
+                ftp_session_list(session, url, method, user, password, options, { bytes, count, pointer in
             guard let bytes, let pointer else { return 0 }
             let context = Unmanaged<TransferContext>.fromOpaque(pointer).takeUnretainedValue()
             // A malformed server cannot allocate unlimited memory for a directory.
@@ -291,10 +345,11 @@ final class FTPClient: FTPServing, @unchecked Sendable {
                 let pointer = Unmanaged.passUnretained(context).toOpaque()
                 do {
                     try cancellation.checkCancellation()
+                    let session = try curlDriver?.borrow()
                     let result = withOptions(endpoint) { options in
                         name.bytes.withUnsafeBytes { bytes in
                             credentials.username.withCString { user in credentials.password.withCString { password in
-                                ftp_mkdir(url, bytes.bindMemory(to: UInt8.self).baseAddress, bytes.count, user, password, options, { pointer in
+                                ftp_session_mkdir(session, url, bytes.bindMemory(to: UInt8.self).baseAddress, bytes.count, user, password, options, { pointer in
                                     guard let pointer else { return 1 }
                                     return Unmanaged<TransferContext>.fromOpaque(pointer).takeUnretainedValue().cancellation.isCancelled ? 1 : 0
                                 }, pointer)
@@ -302,7 +357,15 @@ final class FTPClient: FTPServing, @unchecked Sendable {
                         }
                     }
                     try cancellation.checkCancellation()
-                    try validate(result, endpoint: endpoint, upload: true, credentials: credentials)
+                    do { try validate(result, endpoint: endpoint, upload: true, credentials: credentials) }
+                    catch {
+                        // Numeric protocol/timeout classification, never error-text matching.
+                        // Excludes TLS, login, local setup and cancellation failures.
+                        if curlDriver != nil, result.directory_attempted != 0, [8, 21, 28, 55, 56].contains(Int(result.code)), result.response_code >= 200, result.response_code != 530 {
+                            throw DirectoryCreationError(underlying: error)
+                        }
+                        throw error
+                    }
                     continuation.resume()
                 } catch { continuation.resume(throwing: error) }
             }
@@ -337,10 +400,11 @@ final class FTPClient: FTPServing, @unchecked Sendable {
                 do {
                 try cancellation.checkCancellation()
                 try source.validateDescriptor()
+                let session = try curlDriver?.borrow()
                 let result = withOptions(endpoint) { options in
                     credentials.username.withCString { user in
                     credentials.password.withCString { password in
-                        ftp_upload_fd(url, source.descriptor, user, password, options, { sent, total, pointer in
+                        ftp_session_upload_fd(session, url, source.descriptor, user, password, options, { sent, total, pointer in
                             guard let pointer else { return }
                             let context = Unmanaged<TransferContext>.fromOpaque(pointer).takeUnretainedValue()
                             if !context.cancellation.isCancelled { context.progress?(sent, total) }
@@ -378,9 +442,10 @@ final class FTPClient: FTPServing, @unchecked Sendable {
                 let pointer = Unmanaged.passUnretained(context).toOpaque()
                 do {
                     try cancellation.checkCancellation()
+                    let session = try curlDriver?.borrow()
                     let result = withOptions(endpoint) { options in
                         credentials.username.withCString { user in credentials.password.withCString { password in
-                            ftp_download(remote, user, password, options, { bytes, count, pointer in
+                            ftp_session_download(session, remote, user, password, options, { bytes, count, pointer in
                                 guard let bytes, let pointer else { return 0 }
                                 let context = Unmanaged<TransferContext>.fromOpaque(pointer).takeUnretainedValue()
                                 do {

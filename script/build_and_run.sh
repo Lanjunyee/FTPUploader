@@ -11,7 +11,9 @@ case "$MODE" in
   *) echo "usage: $0 [--verify|--debug|--logs|--telemetry]" >&2; exit 2 ;;
 esac
 
-if [[ ! -f "$PROJECT_ROOT/.build/secure-deps/universal/lib/libssh2.a" ]]; then
+# Library existence alone is not evidence of matching pins/toolchain/architecture.
+# This check is read-only and never downloads; only a mismatch enters pinned build.
+if ! "$PROJECT_ROOT/script/build_secure_dependencies.sh" --check; then
   "$PROJECT_ROOT/script/build_secure_dependencies.sh"
 fi
 

@@ -18,7 +18,7 @@ struct SiteManagementView: View {
             HStack {
                 Text(title).font(.headline)
                 Spacer()
-                if sites.isSaving { ProgressView().controlSize(.small) }
+                if sites.isSaving || sites.isRecovering { ProgressView().controlSize(.small) }
             }
             if draft != nil {
                 ScrollView {
@@ -50,6 +50,12 @@ struct SiteManagementView: View {
                     Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.red)
                 }
                 .font(.callout)
+            }
+            if sites.isRecovering {
+                Text("正在恢复本机站点事务，不会连接服务器…").font(.callout).foregroundStyle(.secondary)
+            } else if sites.canRetryRecovery {
+                Button("重试站点恢复／清理") { Task { await sites.retryRecovery() } }
+                    .disabled(!model.canEditConnection)
             }
             Divider()
             HStack {

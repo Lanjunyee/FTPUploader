@@ -1,6 +1,35 @@
 import XCTest
 
 final class AuthenticationTests: XCTestCase {
+    func testOptionalProtocolCountersPreserveListingsAndContainOnlyNumericTotals() async throws {
+        for transport in [FileTransport.ftp, .ftpsExplicit, .ftpsImplicit] {
+            for enabled in [false, true] {
+                let fixture = try FTPFixture(transport: transport, countOperations: enabled)
+                defer { fixture.stop() }
+                let listing = try await FTPClient(caFile: testCA).list(endpoint: fixture.endpoint, path: .root,
+                    credentials: .account(username: "member", password: "fixture-pass:@ "))
+                XCTAssertFalse(listing.entries.isEmpty)
+                let counts = try fixture.operationCounts()
+                if enabled {
+                    XCTAssertEqual(counts, ["connections": 1, "authentications": 1, "listings": 1])
+                } else { XCTAssertNil(counts) }
+            }
+        }
+        for enabled in [false, true] {
+            let fixture = try SFTPFixture(countOperations: enabled)
+            defer { fixture.stop() }
+            let trust = HostTrustStore(url: fixture.root.appendingPathComponent(".trust.json"))
+            try trust.trust(fixture.identity)
+            let listing = try await FTPClient(trust: trust).list(endpoint: fixture.endpoint, path: .root,
+                credentials: .account(username: "member", password: "fixture-pass:@ "))
+            XCTAssertFalse(listing.entries.isEmpty)
+            let counts = try fixture.operationCounts()
+            if enabled {
+                XCTAssertEqual(counts, ["connections": 1, "authentications": 1, "listings": 1])
+            } else { XCTAssertNil(counts) }
+        }
+    }
+
     func testAccountIdentityForBrowsingFallbackAndBinaryUpload() async throws {
         for scenario in ["account-only", "no-mlsd"] {
             let fixture = try FTPFixture(scenario: scenario)

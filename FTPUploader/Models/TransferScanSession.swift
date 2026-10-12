@@ -10,6 +10,7 @@ final class TransferScanSession: ObservableObject {
     @Published private(set) var discoveredNodes = 0
     private(set) var generation = UUID()
     private var cancellation: FTPCancellationToken?
+    private var progressMailbox: TransferProgressMailbox?
     var isLocked: Bool { phase.isLocked }
     var cancellationID: UUID? { cancellation?.id ?? (phase == .preview ? generation : nil) }
     /// Called before unlocking a cancelled/failed scan or a discarded preview.
@@ -21,11 +22,20 @@ final class TransferScanSession: ObservableObject {
         guard phase == .finished, cancellation == nil else { return false }
         let id = UUID(), token = FTPCancellationToken()
         generation = id; cancellation = token; plan = nil; error = nil; discoveredNodes = 0; phase = .scanning
+        let mailbox = TransferProgressMailbox(generation: token.id) { [weak self] sample in
+            self?.discovered(Int(clamping: sample.bytes), cancellationID: token.id)
+        }
+        progressMailbox = mailbox
         Task {
+            defer {
+                mailbox.stop()
+                if progressMailbox === mailbox { progressMailbox = nil }
+            }
             do {
                 let result = try await operation(token)
                 try token.checkCancellation()
                 guard generation == id, cancellation === token else { return }
+                discoveredNodes = min(TransferPlan.maximumNodes, max(discoveredNodes, result.nodes.count))
                 plan = result; phase = .preview
             } catch {
                 guard cancellation === token else { return }
@@ -37,6 +47,13 @@ final class TransferScanSession: ObservableObject {
         return true
     }
 
+    func discoveryHandler(cancellationID: UUID) -> (Int) -> Void {
+        guard phase == .scanning, cancellation?.id == cancellationID, let mailbox = progressMailbox else { return { _ in } }
+        return { [weak mailbox] count in
+            mailbox?.submit(bytes: Int64(clamping: max(0, count)), total: -1, generation: cancellationID)
+        }
+    }
+
     func discovered(_ count: Int, cancellationID: UUID) {
         guard phase == .scanning, cancellation?.id == cancellationID else { return }
         discoveredNodes = min(TransferPlan.maximumNodes, max(discoveredNodes, count))
@@ -45,6 +62,7 @@ final class TransferScanSession: ObservableObject {
     func cancel(id: UUID? = nil) {
         if let id, id != cancellationID { return }
         guard phase == .scanning || phase == .preview else { return }
+        progressMailbox?.stop()
         generation = UUID(); plan = nil
         if let cancellation { phase = .cancelling; cancellation.cancel() }
         else { onDiscard?(); phase = .finished }

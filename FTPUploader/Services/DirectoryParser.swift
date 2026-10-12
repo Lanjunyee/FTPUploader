@@ -1,6 +1,9 @@
 import Foundation
 
 enum DirectoryParser {
+    private static let totalLine = try? NSRegularExpression(pattern: "^total [0-9]+$")
+    private static let unixLine = try? NSRegularExpression(pattern: "^([dlbcps-])[rwxstST-]{9}[+@.]?\\s+\\d+\\s+\\S+\\s+\\S+\\s+(\\d+(?:,\\s*\\d+)?)\\s+\\S+\\s+\\d{1,2}\\s+(?:\\d{1,2}:\\d{2}|\\d{4})\\s(.+)$")
+    private static let dosLine = try? NSRegularExpression(pattern: "^\\d{2}-\\d{2}-\\d{2,4}\\s+\\d{1,2}:\\d{2}(?:AM|PM)\\s+(<DIR>|\\d+)\\s+(.+)$", options: .caseInsensitive)
     static func parse(_ data: Data, machineReadable: Bool, preferredEncoding: FTPTextEncoding? = nil) throws -> DirectoryListing {
         guard data.count <= TransferPlan.maximumListingBytes else { throw FTPError.incompatibleListing }
         let encoding = try preferredEncoding ?? FTPTextEncoding.detect(data)
@@ -10,7 +13,7 @@ enum DirectoryParser {
         for rawLine in text.components(separatedBy: "\n") {
             let line = rawLine.hasSuffix("\r") ? String(rawLine.dropLast()) : rawLine
             if line.isEmpty { continue }
-            if !machineReadable && line.range(of: "^total [0-9]+$", options: .regularExpression) != nil { continue }
+            if !machineReadable && totalLine?.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) != nil { continue }
             let entry = try machineReadable ? mlsd(line, encoding: encoding) : legacy(line, encoding: encoding)
             guard let entry else { continue }
             guard names.insert(entry.rawName).inserted else { throw FTPError.incompatibleListing }
@@ -47,7 +50,7 @@ enum DirectoryParser {
     }
 
     private static func legacy(_ line: String, encoding: FTPTextEncoding) throws -> RemoteEntry? {
-        if let groups = captures(line, pattern: "^([dlbcps-])[rwxstST-]{9}[+@.]?\\s+\\d+\\s+\\S+\\s+\\S+\\s+(\\d+(?:,\\s*\\d+)?)\\s+\\S+\\s+\\d{1,2}\\s+(?:\\d{1,2}:\\d{2}|\\d{4})\\s(.+)$") {
+        if let groups = captures(line, regex: unixLine) {
             let kind: RemoteEntry.Kind
             switch groups[0] {
             case "d": kind = .directory
@@ -62,14 +65,14 @@ enum DirectoryParser {
             }
             return try makeEntry(name, kind: kind, size: Int64(groups[1]), encoding: encoding)
         }
-        if let groups = captures(line, pattern: "^\\d{2}-\\d{2}-\\d{2,4}\\s+\\d{1,2}:\\d{2}(?:AM|PM)\\s+(<DIR>|\\d+)\\s+(.+)$", options: .caseInsensitive) {
+        if let groups = captures(line, regex: dosLine) {
             return try makeEntry(groups[1], kind: groups[0].uppercased() == "<DIR>" ? .directory : .regularFile, size: Int64(groups[0]), encoding: encoding)
         }
         throw FTPError.incompatibleListing
     }
 
-    private static func captures(_ text: String, pattern: String, options: NSRegularExpression.Options = []) -> [String]? {
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: options),
+    private static func captures(_ text: String, regex: NSRegularExpression?) -> [String]? {
+        guard let regex,
               let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) else { return nil }
         return (1..<match.numberOfRanges).compactMap {
             Range(match.range(at: $0), in: text).map { String(text[$0]) }

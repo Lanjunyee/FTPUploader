@@ -47,7 +47,7 @@ struct TransferPlanPreviewContent: View {
                                    onTraverse: { forward in
                 focus = Self.traversal(from: focus, forward: forward, roots: removableRoots, canStart: plan.canStart)
             }) {
-                VStack(alignment: .leading, spacing: 12) {
+                LazyVStack(alignment: .leading, spacing: 12) {
                     ForEach(plan.roots) { root in
                         // Vertical layout reserves the button's width instead of
                         // letting a long root path push it outside a narrow viewport.
@@ -76,6 +76,7 @@ struct TransferPlanPreviewContent: View {
                         }.frame(maxWidth: .infinity, alignment: .leading)
                             .accessibilityElement(children: .combine)
                             .accessibilityLabel(title(node) + "\n" + details(node))
+                            .id(node.id)
                         Divider()
                     }
                 }.padding(8)

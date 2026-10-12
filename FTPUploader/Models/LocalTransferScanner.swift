@@ -1,6 +1,110 @@
 import Foundation
 import Darwin
 
+/// One read-only phase, with fixed transport/authentication and predeclared plan lookups.
+/// Never passed to execution. Only requested entries survive full-list validation.
+@MainActor
+final class PreviewListingCache {
+    struct Lookup {
+        let path: RemotePath
+        let encoding: FTPTextEncoding?
+        let rawName: Data
+    }
+    struct Match { let entry: RemoteEntry?; let encoding: FTPTextEncoding }
+    private struct Key: Hashable {
+        let transport: String
+        let host: String
+        let port: Int
+        let authentication: UUID
+        let generation: UUID
+        let path: [Data]
+        let encoding: String
+    }
+    private struct Context {
+        let client: FTPServing
+        let endpoint: FTPEndpoint
+        let credentials: FTPCredentials
+        let cancellation: FTPCancellationToken
+        let targetInspection: Bool
+    }
+    private struct IndexedListing {
+        let entries: [Data: RemoteEntry]
+        let encoding: FTPTextEncoding
+    }
+    private let authentication = UUID()
+    private var context: Context?
+    private var requested: [Key: Set<Data>] = [:]
+    private var listings: [Key: IndexedListing] = [:]
+    private var failures: [Key: Error] = [:]
+    private var inFlight: [Key: Task<IndexedListing, Error>] = [:]
+    var cachedDirectoryCount: Int { listings.count }
+    var retainedEntryCount: Int { listings.values.reduce(0) { $0 + $1.entries.count } }
+
+    init(client: FTPServing, endpoint: FTPEndpoint, credentials: FTPCredentials,
+         cancellation: FTPCancellationToken, lookups: [Lookup], targetInspection: Bool = false) throws {
+        guard lookups.count <= TransferPlan.maximumNodes else { throw FTPError.localFile("预览核对清单超过限制。") }
+        context = Context(client: client, endpoint: endpoint, credentials: credentials, cancellation: cancellation, targetInspection: targetInspection)
+        for lookup in lookups {
+            try RemotePath.validateName(lookup.rawName)
+            requested[key(lookup, context: context!), default: []].insert(lookup.rawName)
+        }
+    }
+
+    func close() {
+        if !inFlight.isEmpty { context?.cancellation.cancel() }
+        inFlight.values.forEach { $0.cancel() }
+        inFlight.removeAll(); listings.removeAll(); failures.removeAll(); requested.removeAll(); context = nil
+    }
+
+    private func key(_ lookup: Lookup, context: Context) -> Key {
+        Key(transport: context.endpoint.transport.rawValue, host: context.endpoint.host, port: context.endpoint.port,
+            authentication: authentication, generation: context.cancellation.id, path: lookup.path.components.map(\.bytes),
+            encoding: lookup.encoding.map { $0 == .utf8 ? "utf8" : "gb18030" } ?? "automatic")
+    }
+
+    func match(_ lookup: Lookup) async throws -> Match {
+        guard let context else { throw CancellationError() }
+        do { try context.cancellation.checkCancellation() }
+        catch { close(); throw error }
+        let key = key(lookup, context: context)
+        guard let names = requested[key], names.contains(lookup.rawName) else {
+            throw FTPError.localFile("预览查询不属于本次固定清单。")
+        }
+        if let value = listings[key] { return Match(entry: value.entries[lookup.rawName], encoding: value.encoding) }
+        if let error = failures[key] { throw error }
+        let task: Task<IndexedListing, Error>
+        if let pending = inFlight[key] { task = pending }
+        else {
+            task = Task {
+                let listing: DirectoryListing
+                if context.targetInspection {
+                    guard let encoding = lookup.encoding else { throw FTPError.invalidName }
+                    listing = try await context.client.listPreviewTargets(endpoint: context.endpoint, path: lookup.path,
+                        encoding: encoding, credentials: context.credentials, cancellation: context.cancellation)
+                } else {
+                    listing = try await context.client.list(endpoint: context.endpoint, path: lookup.path,
+                        encoding: lookup.encoding, credentials: context.credentials, cancellation: context.cancellation)
+                }
+                try context.cancellation.checkCancellation()
+                return IndexedListing(entries: try listing.indexed(names: names, cancellation: context.cancellation), encoding: listing.encoding)
+            }
+            inFlight[key] = task
+        }
+        defer { inFlight.removeValue(forKey: key) }
+        do {
+            let value = try await task.value
+            try context.cancellation.checkCancellation()
+            guard self.context != nil else { throw CancellationError() }
+            listings[key] = value
+            return Match(entry: value.entries[lookup.rawName], encoding: value.encoding)
+        } catch {
+            if context.cancellation.isCancelled || error is CancellationError { close(); throw CancellationError() }
+            if self.context != nil { failures[key] = error }
+            throw error
+        }
+    }
+}
+
 /// Retry refreshes a fixed confirmed list, never enumerates a source tree.
 struct TransferRetryPlanner {
     static func remap(_ plan: TransferPlan) -> TransferPlan {
@@ -86,6 +190,15 @@ struct TransferRetryPlanner {
     func inspectTargets(_ plan: TransferPlan, client: FTPServing, endpoint: FTPEndpoint,
                         credentials: FTPCredentials, destination: LocalDestinationRoot?,
                         cancellation: FTPCancellationToken) async throws -> TransferPlan {
+        let lookups = try plan.nodes.compactMap { node -> PreviewListingCache.Lookup? in
+            guard case .remote(let path, let encoding) = node.target else { return nil }
+            guard let parent = path.parent, let name = path.components.last,
+                  try encoding.encode(name.name) == name.bytes else { throw FTPError.invalidName }
+            return .init(path: parent, encoding: encoding, rawName: name.bytes)
+        }
+        let cache = try PreviewListingCache(client: client, endpoint: endpoint, credentials: credentials,
+            cancellation: cancellation, lookups: lookups, targetInspection: true)
+        defer { cache.close() }
         var missing = Set<UUID>(), existing = Set<UUID>(), issues = plan.issues
         let local = try destination.map { try LocalDestinationService(root: $0) }
         for node in plan.nodes {
@@ -98,8 +211,8 @@ struct TransferRetryPlanner {
             switch node.target {
             case .remote(let path, let encoding):
                 guard let parent = path.parent, let name = path.components.last else { throw FTPError.invalidName }
-                kind = try await client.checkUploadTarget(endpoint: endpoint, path: parent, name: name.name,
-                    encoding: encoding, credentials: credentials, cancellation: cancellation)?.kind
+                let match = try await cache.match(.init(path: parent, encoding: encoding, rawName: name.bytes))
+                kind = match.entry?.kind
             case .local:
                 guard let local else { throw FTPError.localFile("重试目的根未授权。") }
                 kind = try local.targetKind(node.relativePath.map(\.name))
@@ -119,30 +232,30 @@ struct TransferRetryPlanner {
                             issues: issues, existingTargetIDs: existing)
     }
 
+    @MainActor
     func download(_ plan: TransferPlan, client: FTPServing, endpoint: FTPEndpoint,
                   credentials: FTPCredentials, cancellation: FTPCancellationToken) async throws -> TransferPlan {
+        let lookups = try plan.nodes.map { node -> PreviewListingCache.Lookup in
+            guard case .remote(let path, let encoding) = node.source,
+                  let parent = path.parent, let name = path.components.last else { throw FTPError.invalidName }
+            return .init(path: parent, encoding: encoding, rawName: name.bytes)
+        }
+        let cache = try PreviewListingCache(client: client, endpoint: endpoint, credentials: credentials,
+            cancellation: cancellation, lookups: lookups)
+        defer { cache.close() }
         var nodes: [TransferPlan.Node] = []
         for node in plan.nodes {
             try cancellation.checkCancellation()
             guard case .remote(let path, let encoding) = node.source,
                   let parent = path.parent, let name = path.components.last else { throw FTPError.invalidName }
-            let listing = try await client.list(endpoint: endpoint, path: parent, encoding: encoding,
-                credentials: credentials, cancellation: cancellation)
+            let match = try await cache.match(.init(path: parent, encoding: encoding, rawName: name.bytes))
             try cancellation.checkCancellation()
-            var listingBytes = 0
-            for entry in listing.entries {
-                guard entry.rawName.count <= TransferPlan.maximumListingBytes - listingBytes else {
-                    throw FTPError.localFile("重试来源列表超过限制。")
-                }
-                listingBytes += entry.rawName.count
-            }
-            let matches = listing.entries.filter { $0.rawName == name.bytes }
-            guard matches.count == 1, let entry = matches.first, entry.kind == node.kind,
-                  try listing.encoding.decode(entry.rawName) == name.name else {
+            guard let entry = match.entry, entry.kind == node.kind,
+                  try match.encoding.decode(entry.rawName) == name.name else {
                 throw FTPError.localFile("重试来源消失、重名、编码或类型变化。")
             }
             nodes.append(.init(id: node.id, rootID: node.rootID, kind: node.kind,
-                source: .remote(path, listing.encoding), target: node.target, relativePath: node.relativePath,
+                source: .remote(path, match.encoding), target: node.target, relativePath: node.relativePath,
                 parentID: node.parentID, size: entry.size, snapshot: .remote(kind: entry.kind, size: entry.size)))
         }
         try cancellation.checkCancellation()

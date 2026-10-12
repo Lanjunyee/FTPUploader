@@ -1,4 +1,12 @@
 import XCTest
+import Darwin
+
+private final class VerifiedDescriptorProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Int32?
+    func record(_ descriptor: Int32) { lock.lock(); value = descriptor; lock.unlock() }
+    var descriptor: Int32? { lock.lock(); defer { lock.unlock() }; return value }
+}
 
 final class SelectedFileTests: XCTestCase {
     func testUnreadableFileAndDirectoryAreRejected() throws {
@@ -32,6 +40,25 @@ final class VerifiedUploadSourceTests: XCTestCase {
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
         addTeardownBlock { try? FileManager.default.removeItem(at: url) }
         return url
+    }
+    func testFinalHashAndPayloadReadShareDescriptorEvenWhenDisplayPathIsReplaced() async throws {
+        let base = try folder(), url = base.appendingPathComponent("file")
+        let payload = Data("authorized fixed descriptor".utf8); try payload.write(to: url)
+        let counts = TransferDiagnostics(), probe = VerifiedDescriptorProbe()
+        let selected = try SelectedLocalFile(url: url, diagnostics: counts)
+        defer { selected.endAccess() }
+        let initial = try await selected.snapshot()
+        let source = try await selected.verifiedSource(matching: initial, cancellation: FTPCancellationToken(), didVerifyDescriptor: probe.record)
+        XCTAssertEqual(probe.descriptor, source.descriptor)
+        XCTAssertEqual(counts.snapshot["hashPasses"], 2); XCTAssertEqual(counts.snapshot["hashBytes"], Int64(payload.count * 2))
+        try FileManager.default.moveItem(at: url, to: base.appendingPathComponent("original"))
+        try Data("unapproved replacement".utf8).write(to: url)
+        try source.validateDescriptor()
+        let fd = dup(source.descriptor); XCTAssertGreaterThanOrEqual(fd, 0)
+        let reader = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        defer { try? reader.close() }
+        XCTAssertEqual(try reader.readToEnd(), payload, "Payload read must not reopen the displayed URL")
+        XCTAssertNotEqual(try Data(contentsOf: url), payload)
     }
     func testReplacementBeforeDescriptorVerificationRejectsLinkFileAndAncestorChanges() async throws {
         for replacement in ["link", "file", "ancestor"] {

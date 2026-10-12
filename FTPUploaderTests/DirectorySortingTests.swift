@@ -156,6 +156,33 @@ final class DirectorySortingTests: XCTestCase {
         XCTAssertEqual(loaded, original)
     }
 
+    func testRevisionSelectionProjectionCachesRowsActionsAndRejectsHiddenSelections() {
+        for count in [1_000, 10_000] {
+            let loaded = (0..<count).map { entry(String(format: "item-%05d", $0), size: Int64($0)) }
+            var cache = DirectoryProjectionCache()
+            cache.update(loaded, query: "", sort: .name, ascending: true, generation: 1, location: "/directory")
+            cache.select(Set(loaded.map(\.id)))
+            let selections = cache.selectionProjectionCount
+            XCTAssertEqual(cache.selectedEntries.count, count); XCTAssertEqual(cache.selectionTraversalCount, count)
+            for index in 0..<10_000 {
+                XCTAssertTrue(cache.isCurrent(loaded, query: "", sort: .name, ascending: true, generation: 1, location: "/directory"))
+                XCTAssertEqual(cache.row(id: loaded[index % count].id)?.entry, loaded[index % count])
+                XCTAssertNil(cache.selectedRow)
+                XCTAssertEqual(cache.actions(isBusy: index.isMultiple(of: 2)).count, 1)
+            }
+            for _ in 0..<100 { cache.update(loaded, query: "", sort: .name, ascending: true, generation: 1, location: "/directory") }
+            XCTAssertEqual(cache.projectionCount, 1); XCTAssertEqual(cache.rowProjectionCount, 1)
+            XCTAssertEqual(cache.selectionProjectionCount, selections); XCTAssertEqual(cache.selectionTraversalCount, count)
+            let picked: Set<Data> = [loaded[0].id, loaded[count - 1].id]
+            cache.select(picked); XCTAssertEqual(cache.selectedEntries, [loaded[0], loaded[count - 1]])
+            cache.update(loaded, query: loaded[0].name, sort: .name, ascending: true, generation: 1, location: "/directory")
+            XCTAssertEqual(cache.selectedIDs, [loaded[0].id]); XCTAssertEqual(cache.selectedRow?.id, loaded[0].id)
+            cache.update(loaded, query: "", sort: .name, ascending: true, generation: 1, location: "/directory")
+            XCTAssertEqual(cache.selectedIDs, [loaded[0].id], "Clearing filter must not restore hidden selection")
+            XCTAssertFalse(cache.isCurrent(loaded, query: "", sort: .name, ascending: true, generation: 2, location: "/directory"))
+            XCTAssertEqual(cache.rows.count, count)
+        }
+    }
     func testTenThousandItemProjectionPerformance() {
         let loaded = (0..<10_000).map { entry("中文资料 \($0) %#.txt", size: Int64($0)) }
         measure {

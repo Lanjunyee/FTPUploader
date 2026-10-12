@@ -11,17 +11,20 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from fixture_counts import FixtureCounts
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--port', type=int, default=0)
 parser.add_argument('--root', type=Path)
-parser.add_argument('--scenario', choices=['normal', 'no-mlsd', 'deny-login', 'deny-list', 'malformed', 'legacy', 'slow-list', 'slow-greeting', 'ascii-root', 'empty-root', 'legacy-ascii-root', 'legacy-empty-root', 'deny-root', 'legacy-deny-root', 'account-only', 'echo-password'], default='normal')
+parser.add_argument('--scenario', choices=['normal', 'no-mlsd', 'deny-login', 'deny-list', 'malformed', 'legacy', 'slow-list', 'slow-greeting', 'ascii-root', 'empty-root', 'legacy-ascii-root', 'legacy-empty-root', 'deny-root', 'legacy-deny-root', 'account-only', 'echo-password', 'close-after-list', 'mkdir-list-error'], default='normal')
 parser.add_argument('--delay', type=float, default=2)
 parser.add_argument('--tls', choices=['explicit','implicit'])
 parser.add_argument('--cert', type=Path)
 parser.add_argument('--key', type=Path)
 parser.add_argument('--fail-data-tls', action='store_true')
+parser.add_argument('--counts', action='store_true')
 args = parser.parse_args()
+mkdir_created = threading.Event()
 tls_context = None
 if args.tls:
     tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -41,11 +44,14 @@ if not protected.exists():
 command_log = root / '.commands.jsonl'
 command_log.touch(exist_ok=True)
 log_lock = threading.Lock()
+counts_path = root / '.counts.json' if args.counts else None
+counts = FixtureCounts(counts_path)
 encoding = 'gb18030' if args.scenario.startswith('legacy') else 'utf-8'
 
 
 class Handler(socketserver.StreamRequestHandler):
     def setup(self):
+        counts.record('connections')
         if args.tls == 'implicit':
             self.request = tls_context.wrap_socket(self.request, server_side=True)
         super().setup()
@@ -110,7 +116,8 @@ class Handler(socketserver.StreamRequestHandler):
         return connection
 
     def listing(self, command):
-        if args.scenario == 'deny-list' or (self.cwd == '/' and args.scenario.endswith('deny-root')):
+        counts.record('listings')
+        if (args.scenario == 'mkdir-list-error' and mkdir_created.is_set()) or args.scenario == 'deny-list' or (self.cwd == '/' and args.scenario.endswith('deny-root')):
             self.reply(550, 'Directory access denied')
             self.close_data()
             return
@@ -245,6 +252,7 @@ class Handler(socketserver.StreamRequestHandler):
                     self.user = argument
                     self.reply(331, 'Password required')
                 elif command == 'PASS':
+                    counts.record('authentications')
                     accounts = {'member': 'fixture-pass:@ ', 'guest': 'guest-pass', 'empty': ''}
                     self.logged_in = (self.user == 'anonymous' and args.scenario not in ['deny-login', 'account-only', 'echo-password']) or (
                         self.user in accounts and argument == accounts[self.user] and args.scenario != 'echo-password')
@@ -276,13 +284,17 @@ class Handler(socketserver.StreamRequestHandler):
                     else:
                         try:
                             directory.mkdir()
+                            if args.scenario == 'mkdir-list-error':
+                                mkdir_created.set(); self.reply(550, 'Created but response rejected'); continue
                             if path.startswith('/等待确认/'): time.sleep(args.delay)
                             self.reply(250 if path.startswith('/最终拒绝/') else 257, 'Directory created')
                         except OSError:
                             self.reply(550, 'Directory already exists or cannot be created')
                 elif command == 'EPSV': self.passive(True)
                 elif command == 'PASV': self.passive(False)
-                elif command in ['MLSD', 'LIST', 'NLST']: self.listing(command)
+                elif command in ['MLSD', 'LIST', 'NLST']:
+                    self.listing(command)
+                    if args.scenario == 'close-after-list': break
                 elif command == 'RETR':
                     if not self.retrieve(argument): break
                 elif command == 'STOR':
@@ -314,7 +326,7 @@ def stop(*_):
 
 signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGINT, stop)
-print(json.dumps({'port': server.server_address[1], 'root': str(root), 'log': str(command_log)}), flush=True)
+print(json.dumps({'port': server.server_address[1], 'root': str(root), 'log': str(command_log), 'counts': str(counts_path) if counts_path else None}), flush=True)
 try:
     server.serve_forever(poll_interval=0.05)
 finally:

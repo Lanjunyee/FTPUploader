@@ -47,7 +47,7 @@ final class UploadPlanAuthorization {
 
     func executeDirectory(nodeID: UUID, cancellation: FTPCancellationToken = FTPCancellationToken()) async throws -> RemoteDirectoryResult {
         guard confirmed, !invalidated, active == nil, results[nodeID] == nil,
-              let node = plan.nodes.first(where: { $0.id == nodeID }), node.kind == .directory,
+              let node = plan.index.node(id: nodeID), node.kind == .directory,
               case .remote(let target, let encoding) = node.target else {
             throw FTPError.localFile("目录任务未授权、已结束或不属于确认计划。")
         }

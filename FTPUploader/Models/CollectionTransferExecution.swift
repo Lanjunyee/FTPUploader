@@ -47,7 +47,7 @@ final class CollectionTransferExecution {
             for node in plan.nodes {
                 let target = node.relativePath.reduce(destination.url) { $0.appendingPathComponent($1.name) }
                 guard node.target == .local(target),
-                      let root = plan.roots.first(where: { $0.id == node.rootID }),
+                      let root = plan.index.root(id: node.rootID),
                       case .remote(let rootPath, _) = root.source,
                       case .remote(let sourcePath, _) = node.source,
                       sourcePath.components.map(\.bytes) == (rootPath.components + node.relativePath.dropFirst()).map(\.bytes) else {
@@ -69,13 +69,7 @@ final class CollectionTransferExecution {
         sources.values.forEach { $0.endAccess() }; destination?.endAccess()
     }
     private func directories(rootID: UUID) -> [[String]: (UInt64, UInt64)] {
-        var values: [[String]: (UInt64, UInt64)] = [:]
-        for node in plan.nodes where node.rootID == rootID {
-            if case .localDirectory(let device, let inode) = node.snapshot {
-                values[node.relativePath.dropFirst().map(\.name)] = (device, inode)
-            }
-        }
-        return values
+        plan.index.localDirectories(rootID: rootID)
     }
     func job(for node: TransferPlan.Node) throws -> TransferJob {
         let remote: RemotePath, encoding: FTPTextEncoding, url: URL
@@ -94,10 +88,12 @@ final class CollectionTransferExecution {
     private func verifyRemote(_ node: TransferPlan.Node, job: TransferJob) async throws {
         guard case .remote(let path, let encoding) = node.source, let parent = path.parent,
               let name = path.components.last else { throw FTPError.invalidName }
+        // Execution always fetches a new listing; no preview cache is retained here.
         let listing = try await client.list(endpoint: endpoint, path: parent, encoding: encoding,
                                              credentials: credentials, cancellation: job.cancellation)
         try job.cancellation.checkCancellation()
-        guard listing.entries.first(where: { $0.rawName == name.bytes })?.kind == node.kind else {
+        let entry = try listing.indexed(names: [name.bytes], cancellation: job.cancellation)[name.bytes]
+        guard entry?.kind == node.kind, entry?.name == name.name else {
             throw FTPError.localFile("远程来源消失或类型发生变化。")
         }
     }
@@ -113,7 +109,7 @@ final class CollectionTransferExecution {
     /// Returns whether a directory was reused; files return false and report bytes separately.
     func execute(_ node: TransferPlan.Node, job: TransferJob, decide: () async throws -> Void,
                  cleanupFailure: (Error) -> Void, progress: @escaping (Int64, Int64) -> Void) async throws -> Bool {
-        guard confirmed, plan.nodes.contains(node) else { throw FTPError.localFile("节点不属于确认计划。") }
+        guard confirmed, plan.index.contains(node) else { throw FTPError.localFile("节点不属于确认计划。") }
         if node.kind == .directory {
             var reused = false
             try await executor.execute(job) {
@@ -138,6 +134,7 @@ final class CollectionTransferExecution {
                 guard let root = sources[node.rootID], case .localFile(let expected) = node.snapshot else {
                     throw FTPError.localFile("来源快照不符。")
                 }
+                // Per-operation check, never the preview's existingTargetIDs or cached response.
                 if let existing = try await client.checkUploadTarget(endpoint: endpoint, path: job.path, name: job.name,
                     encoding: job.encoding, credentials: credentials, cancellation: job.cancellation) {
                     guard existing.kind == .regularFile else { throw FTPError.uploadTargetConflict }

@@ -19,7 +19,8 @@ final class LocalDownload {
     private var closed = false
     private var committed = false
     private var temporaryIdentity: Identity?
-    private let scoped: Bool
+    private var scoped: Bool
+    private let scope: LocalSecurityScope?
     private(set) var authorizedIdentity: Identity?
     private let write: (FileHandle, Data) throws -> Void
     private let close: (FileHandle) throws -> Void
@@ -42,6 +43,7 @@ final class LocalDownload {
     }
 
     init(destination: URL, authorizedIdentity: Identity? = nil,
+         scope: LocalSecurityScope = .system,
          write: @escaping (FileHandle, Data) throws -> Void = { try $0.write(contentsOf: $1) },
          close: @escaping (FileHandle) throws -> Void = { try $0.synchronize(); try $0.close() },
          rename: @escaping (String, String, Bool) throws -> Void = { source, target, replace in
@@ -57,12 +59,13 @@ final class LocalDownload {
          }) throws {
         self.destination = destination; self.authorizedIdentity = authorizedIdentity
         self.write = write; self.close = close; self.rename = rename; anchor = nil
-        scoped = destination.startAccessingSecurityScopedResource()
+        self.scope = scope
+        scoped = scope.start(destination)
         do {
             temporaryDirectory = try FileManager.default.url(for: .itemReplacementDirectory, in: .userDomainMask,
                                                              appropriateFor: destination, create: true)
         } catch {
-            if scoped { destination.stopAccessingSecurityScopedResource() }
+            if scoped { scoped = false; scope.stop(destination) }
             throw error
         }
         temporary = temporaryDirectory.appendingPathComponent(".ftpuploader-" + UUID().uuidString + ".part")
@@ -76,7 +79,8 @@ final class LocalDownload {
         } catch {
             try? handle?.close(); handle = nil
             try? FileManager.default.removeItem(at: temporaryDirectory)
-            if scoped { destination.stopAccessingSecurityScopedResource() }
+            cleanupFinished = true
+            if scoped { scoped = false; scope.stop(destination) }
             throw error
         }
     }
@@ -86,7 +90,7 @@ final class LocalDownload {
          write: @escaping (FileHandle, Data) throws -> Void = { try $0.write(contentsOf: $1) },
          close: @escaping (FileHandle) throws -> Void = { try $0.synchronize(); try $0.close() }) throws {
         self.destination = destination; self.anchor = anchor; self.authorizedIdentity = authorizedIdentity
-        self.write = write; self.close = close; rename = nil; scoped = false
+        self.write = write; self.close = close; rename = nil; scoped = false; scope = nil
         temporaryDirectory = anchor.directoryURL; temporary = anchor.fileURL
         do {
             try anchor.validateParent()
@@ -120,6 +124,7 @@ final class LocalDownload {
 
     /// Called only after a separate confirmation that names this exact destination.
     func currentTargetIdentity() throws -> Identity? {
+        guard !cleanupFinished else { throw FTPError.localFile("下载接收器已清理，不能继续核对目标。") }
         if let anchor { try anchor.validateParent(); return try anchor.targetIdentity() }
         return try Self.identity(destination)
     }
@@ -128,7 +133,7 @@ final class LocalDownload {
     func authorizeTarget(_ identity: Identity?) { authorizedIdentity = identity }
 
     func commit() throws {
-        guard closed, !committed, !failed else { throw FTPError.localFile("下载尚未关闭、写入/关闭失败或已经提交。") }
+        guard closed, !committed, !failed, !cleanupFinished else { throw FTPError.localFile("下载尚未关闭、写入/关闭失败或已经提交。") }
         let coordinator = NSFileCoordinator()
         var coordinationError: NSError?
         var failure: Error?
@@ -163,7 +168,10 @@ final class LocalDownload {
 
     func cleanUp() throws {
         guard !cleanupFinished else { return }
-        defer { cleanupFinished = true; anchor?.release() }
+        // A terminal attempt, even one reporting cleanup failure, owns the release.
+        // Retained backend callbacks must not keep security scope or anchor fds alive.
+        cleanupFinished = true
+        defer { anchor?.release(); releaseScope() }
         var closeError: Error?
         if let handle { do { try handle.close() } catch { closeError = error }; self.handle = nil }
         closed = true
@@ -187,10 +195,12 @@ final class LocalDownload {
         } catch { throw FTPError.localFile("无法清理本次下载临时目录：\(temporaryDirectory.path)。\(error.localizedDescription)") }
         if let closeError { throw FTPError.localFile("关闭临时文件失败：\(temporary.path)。\(closeError.localizedDescription)") }
     }
-    deinit {
-        try? cleanUp()
-        if scoped { destination.stopAccessingSecurityScopedResource() }
+    private func releaseScope() {
+        guard scoped else { return }
+        scoped = false
+        scope?.stop(destination)
     }
+    deinit { try? cleanUp() }
 
     /// Same-volume private replacement directory. Every mutation uses directory descriptors.
     /// Parent validation/commit are called on the collection coordinator's actor, not by receive.

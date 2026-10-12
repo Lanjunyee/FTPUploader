@@ -43,6 +43,7 @@ struct TransferActivity {
     var previousTarget: String? = nil
     var warning: String? = nil
     var bytes: Int64 = 0
+    var trafficOverflow = false
     var total: Int64? = nil
     var summary: TransferSummary? = nil
     var sessionTraffic: Int64? = nil
@@ -54,7 +55,7 @@ struct TransferActivity {
     var targetDiffers: Bool { previousTarget != nil && target != previousTarget }
     /// Content reception is not success. Unknown/zero totals never create percentages.
     var contentFraction: Double? {
-        guard kind != .directory, let total, total > 0 else { return nil }
+        guard !trafficOverflow, kind != .directory, let total, total > 0 else { return nil }
         let fraction = min(max(Double(bytes) / Double(total), 0), 1)
         return phase == .succeeded ? fraction : min(fraction, Double(1).nextDown)
     }
@@ -185,7 +186,9 @@ final class TransferActivityObserver: ObservableObject {
         return .init(source: direction == .upload ? .upload : .download, direction: direction, phase: phase,
             name: name, target: target, kind: .regularFile,
             estimate: phase == .executing ? model.metrics.estimate : nil,
-            warning: warning, bytes: bytes, total: total >= 0 ? total : nil,
+            warning: warning, bytes: bytes,
+            trafficOverflow: direction == .upload ? model.uploadTrafficOverflow : model.downloadTrafficOverflow,
+            total: total >= 0 ? total : nil,
             cancellationID: phase.priority == 0 ? model.cancellationID : nil, ended: date)
     }
     private func queueActivity(_ queue: BatchTransferQueue) -> TransferActivity {

@@ -113,29 +113,72 @@ enum DirectoryFeedback: Equatable {
     }
 }
 
-/// Window-local cache. Only directory/query/sort events update it, not byte progress.
+struct DirectoryRow: Identifiable {
+    let entry: RemoteEntry
+    let location: String
+    var id: Data { entry.id }
+    var name: String { entry.name }
+    var kindRank: Int { DirectorySorting.kindRank(isDirectory: entry.isDirectory) }
+    var sizeRank: Int64 { DirectorySorting.sizeRank(entry.size) }
+    var kindTitle: String { entry.kindTitle }
+}
+
+/// Window-local event projection. Revision-based callers never compare the full listing on redraw.
 struct DirectoryProjectionCache {
     private struct Input: Equatable {
-        let entries: [RemoteEntry]
+        let entries: [RemoteEntry]?
+        let generation: UInt64?
+        let location: String
         let query: String
         let sort: DirectorySortColumn
         let ascending: Bool
     }
     private var input: Input?
+    private var visibleIDs = Set<Data>()
+    private var rowsByID: [Data: DirectoryRow] = [:]
+    private var selectionRevision = -1
     private(set) var entries: [RemoteEntry] = []
+    private(set) var rows: [DirectoryRow] = []
+    private(set) var selectedIDs = Set<Data>()
+    private(set) var selectedEntries: [RemoteEntry] = []
+    private var selectionActions: [RemoteDirectorySelection.ActionItem] = []
     private(set) var projectionCount = 0
+    private(set) var rowProjectionCount = 0
+    private(set) var selectionProjectionCount = 0
+    private(set) var selectionTraversalCount = 0
+    var selectedRow: DirectoryRow? { selectedEntries.count == 1 ? rowsByID[selectedEntries[0].id] : nil }
+    func row(id: Data) -> DirectoryRow? { rowsByID[id] }
+    func actions(isBusy: Bool) -> [RemoteDirectorySelection.ActionItem] {
+        selectionActions.map { .init(id: $0.id, title: $0.title, enabled: $0.id == .information || !isBusy) }
+    }
 
     mutating func update(_ loaded: [RemoteEntry], query: String,
-                         sort: DirectorySortColumn, ascending: Bool) {
-        let next = Input(entries: loaded, query: query, sort: sort, ascending: ascending)
+                         sort: DirectorySortColumn, ascending: Bool, generation: UInt64? = nil, location: String = "") {
+        let next = Input(entries: generation == nil ? loaded : nil, generation: generation, location: location,
+            query: query, sort: sort, ascending: ascending)
         guard input != next else { return }
         entries = DirectorySorting.sorted(DirectoryFiltering.filtered(loaded, query: query), by: sort, ascending: ascending)
+        rows = entries.map { DirectoryRow(entry: $0, location: location) }
+        rowsByID = Dictionary(rows.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        visibleIDs = Set(rowsByID.keys)
         input = next
-        projectionCount += 1
+        projectionCount += 1; rowProjectionCount += 1
+        select(selectedIDs)
+    }
+    mutating func select(_ ids: Set<Data>) {
+        let current = ids.intersection(visibleIDs)
+        guard current != selectedIDs || selectionRevision != projectionCount else { return }
+        selectedIDs = current; selectionRevision = projectionCount; selectionProjectionCount += 1
+        if current.isEmpty { selectedEntries = []; selectionActions = []; return }
+        selectionTraversalCount += entries.count
+        let selected = entries.filter { current.contains($0.id) }
+        selectedEntries = selected.count == current.count ? selected : []
+        selectionActions = RemoteDirectorySelection.actions(for: selectedEntries, isBusy: false)
     }
     func isCurrent(_ loaded: [RemoteEntry], query: String,
-                   sort: DirectorySortColumn, ascending: Bool) -> Bool {
-        input == Input(entries: loaded, query: query, sort: sort, ascending: ascending)
+                   sort: DirectorySortColumn, ascending: Bool, generation: UInt64? = nil, location: String = "") -> Bool {
+        input == Input(entries: generation == nil ? loaded : nil, generation: generation, location: location,
+            query: query, sort: sort, ascending: ascending)
     }
 }
 

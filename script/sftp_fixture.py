@@ -2,16 +2,19 @@
 """Disposable localhost SFTP server for integration tests; requires Paramiko test environment."""
 import argparse, base64, json, os, posixpath, signal, socket, stat, tempfile, threading, time
 from pathlib import Path
+from fixture_counts import FixtureCounts
 import paramiko
 from cryptography.hazmat.primitives.asymmetric import rsa, ed25519, ec
 from cryptography.hazmat.primitives import serialization
 from paramiko.sftp import CMD_CLOSE
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--port',type=int,default=0)
-parser.add_argument('--scenario',default='normal',choices=['normal','slow-auth','slow-list','slow-upload','delay-close','reject-close','disconnect','deny-login','invalid-utf8','entry-types'])
+parser.add_argument('--scenario',default='normal',choices=['normal','slow-auth','slow-list','slow-upload','delay-close','reject-close','disconnect','deny-login','invalid-utf8','entry-types','mkdir-after-create-error','mkdir-list-error'])
 parser.add_argument('--key-auth', action='store_true')
 parser.add_argument('--delay',type=float,default=2)
+parser.add_argument('--counts', action='store_true')
 args=parser.parse_args()
+mkdir_created=threading.Event()
 temporary=tempfile.TemporaryDirectory(prefix='sftp-fixture-');root=Path(temporary.name).resolve()
 for directory in ('中文 空格%#','空目录','拒绝访问','拒绝写入','等待确认'):(root/directory).mkdir()
 (root/'中文 空格%#'/'已提交.txt').write_bytes(b'protected\n')
@@ -39,6 +42,8 @@ if args.key_auth:
         target.write_bytes(unsupported.private_bytes(serialization.Encoding.PEM, fmt, serialization.NoEncryption()))
         target.chmod(0o600)
 log=root/'.commands.jsonl';log.touch();lock=threading.Lock()
+counts_path = root/'.counts.json' if args.counts else None
+counts = FixtureCounts(counts_path)
 def record(command,path=''):
     with lock:
         with log.open('a') as out: out.write(json.dumps({'command':command,'path':path},ensure_ascii=False)+'\n')
@@ -46,9 +51,11 @@ class Server(paramiko.ServerInterface):
     def __init__(self,transport):self.transport=transport
     def get_allowed_auths(self,username):return 'publickey,password' if args.key_auth else 'password'
     def check_auth_password(self,username,password):
+        counts.record('authentications')
         record('AUTH')
         return paramiko.AUTH_SUCCESSFUL if username=='member' and password=='fixture-pass:@ ' and args.scenario!='deny-login' else paramiko.AUTH_FAILED
     def check_auth_publickey(self,username,key):
+        counts.record('authentications')
         record('AUTH_KEY')
         if args.scenario=='slow-auth':time.sleep(args.delay)
         return paramiko.AUTH_SUCCESSFUL if username=='member' and key.get_base64() in authorized_keys and args.scenario!='deny-login' else paramiko.AUTH_FAILED
@@ -74,8 +81,9 @@ class Files(paramiko.SFTPServerInterface):
         if candidate!=root and root not in candidate.parents:raise OSError('outside test root')
         return candidate
     def list_folder(self,path):
+        counts.record('listings')
         record('LIST',path)
-        if path=='/拒绝访问':return paramiko.SFTP_PERMISSION_DENIED
+        if path=='/拒绝访问' or (args.scenario=='mkdir-list-error' and mkdir_created.is_set()):return paramiko.SFTP_PERMISSION_DENIED
         if args.scenario=='slow-list':time.sleep(args.delay)
         try:
             entries=[]
@@ -101,6 +109,8 @@ class Files(paramiko.SFTPServerInterface):
         try:
             self.local(path).mkdir(mode=0o755)
             if path.startswith('/等待确认/'):time.sleep(args.delay)
+            if args.scenario in ('mkdir-after-create-error','mkdir-list-error'):
+                mkdir_created.set();return paramiko.SFTP_FAILURE
             return paramiko.SFTP_OK
         except OSError:return paramiko.SFTP_FAILURE
     def remove(self,path):
@@ -139,6 +149,7 @@ class Subsystem(paramiko.SFTPServer):
 listener=socket.socket();listener.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);listener.bind(('127.0.0.1',args.port));listener.listen();listener.settimeout(.2)
 stop=threading.Event();transports=[]
 def session(client):
+    counts.record('connections')
     transport=paramiko.Transport(client);transports.append(transport);transport.add_server_key(key)
     transport.set_subsystem_handler('sftp',Subsystem,Files)
     try:
@@ -148,7 +159,7 @@ def session(client):
     finally:transport.close()
 def shutdown(*_):stop.set()
 signal.signal(signal.SIGTERM,shutdown);signal.signal(signal.SIGINT,shutdown)
-print(json.dumps({'port':listener.getsockname()[1],'root':str(root),'log':str(log),'key':base64.b64encode(key.asbytes()).decode()}),flush=True)
+print(json.dumps({'port':listener.getsockname()[1],'root':str(root),'log':str(log),'key':base64.b64encode(key.asbytes()).decode(),'counts':str(counts_path) if counts_path else None}),flush=True)
 try:
     while not stop.is_set():
         try:client,_=listener.accept()

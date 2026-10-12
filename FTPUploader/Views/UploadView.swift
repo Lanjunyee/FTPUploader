@@ -44,7 +44,7 @@ struct UploadPresentationOwner: ViewModifier {
                 }
             .onChange(of: bus.request) { request in handle(request) }
             .onChange(of: model.pendingTarget) { _ in detail = nil }
-            .onChange(of: model.selectedFile?.name) { _ in detail = nil }
+            .onChange(of: model.selectedFile.map { ObjectIdentifier($0) }) { _ in detail = nil }
             .onChange(of: model.selectionError) { _ in detail = nil }
             .onChange(of: model.uploadState) { state in
                 detail = nil

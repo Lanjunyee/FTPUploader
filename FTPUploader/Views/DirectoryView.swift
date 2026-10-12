@@ -1,19 +1,6 @@
 import AppKit
 import SwiftUI
 
-/// One directory row adapted for the table's sortable columns. The sort keys come
-/// from `DirectorySorting`, so the table orders entries exactly as the unit tests say.
-private struct DirectoryRow: Identifiable {
-    let entry: RemoteEntry
-    let location: String
-
-    var id: Data { entry.id }
-    var name: String { entry.name }
-    var kindRank: Int { DirectorySorting.kindRank(isDirectory: entry.isDirectory) }
-    var sizeRank: Int64 { DirectorySorting.sizeRank(entry.size) }
-    var kindTitle: String { entry.kindTitle }
-}
-
 /// The connected state: a native table becomes the window body. Navigation lives in
 /// the toolbar, so this view owns the table, the failure notice and the footer only.
 @MainActor
@@ -39,13 +26,18 @@ struct DirectoryView: View {
         return comparator.keyPath == \.name ? .name : (comparator.keyPath == \.sizeRank ? .size : .kind)
     }
     private var sortAscending: Bool { sortOrder.first?.order != .reverse }
-    private var rows: [DirectoryRow] {
-        projection.entries.map { DirectoryRow(entry: $0, location: model.currentLocation) }
+    private var rows: [DirectoryRow] { projection.rows }
+    private var selectionIsCurrent: Bool {
+        directoryContext == model.effectiveDirectoryContext &&
+            projection.isCurrent(model.entries, query: filterQuery, sort: sortColumn, ascending: sortAscending,
+                generation: model.directoryContentRevision, location: model.currentLocation)
     }
     private func updateProjection() {
         uiRevision &+= 1
-        projection.update(model.entries, query: filterQuery, sort: sortColumn, ascending: sortAscending)
-        selectedEntries.formIntersection(Set(projection.entries.map(\.id)))
+        projection.update(model.entries, query: filterQuery, sort: sortColumn, ascending: sortAscending,
+            generation: model.directoryContentRevision, location: model.currentLocation)
+        projection.select(selectedEntries)
+        selectedEntries = projection.selectedIDs
         nameEntry = nil
         syncOpenAvailability()
     }
@@ -100,13 +92,18 @@ struct DirectoryView: View {
             directoryContext = context
             updateProjection()
         }
-        .onChange(of: model.entries) { _ in updateProjection() }
-        .onChange(of: selectedEntries) { _ in uiRevision &+= 1; nameEntry = nil; syncOpenAvailability() }
+        .onChange(of: model.directoryContentRevision) { _ in updateProjection() }
+        .onChange(of: selectedEntries) { _ in
+            projection.select(selectedEntries)
+            selectedEntries = projection.selectedIDs
+            uiRevision &+= 1; nameEntry = nil; syncOpenAvailability()
+        }
         .onChange(of: model.isBusy) { _ in syncOpenAvailability() }
         .onAppear { directoryContext = model.effectiveDirectoryContext; updateProjection() }
         .onDisappear {
             uiRevision &+= 1
             selectedEntries = []
+            projection.select([])
             filterQuery = ""
             directoryContext = nil
             nameEntry = nil
@@ -167,16 +164,10 @@ struct DirectoryView: View {
         focus = .directory
     }
 
-    private var selectedRows: [DirectoryRow] {
-        guard directoryContext == model.effectiveDirectoryContext,
-              projection.isCurrent(model.entries, query: filterQuery, sort: sortColumn, ascending: sortAscending) else { return [] }
-        let entries = RemoteDirectorySelection.selected(in: rows.map(\.entry), ids: selectedEntries)
-        let valid = Set(entries.map(\.id))
-        return rows.filter { valid.contains($0.id) }
-    }
+    private var selectedRows: [RemoteEntry] { selectionIsCurrent ? projection.selectedEntries : [] }
 
     private var selectionMenu: some View {
-        ForEach(RemoteDirectorySelection.actions(for: selectedRows.map(\.entry), isBusy: model.isBusy)) { item in
+        ForEach(selectionIsCurrent ? projection.actions(isBusy: model.isBusy) : []) { item in
             Button(item.title) { perform(item.id) }.disabled(!item.enabled)
         }
     }
@@ -185,15 +176,15 @@ struct DirectoryView: View {
         // Every route resolves the current selection again at event time.
         switch action {
         case .openFolder: openSelectedFolder()
-        case .download: chooseDownload(selectedRows.map(\.entry))
+        case .download: chooseDownload(selectedRows)
         case .information: nameEntry = selectedRow?.id
         }
     }
-    private var selectedRow: DirectoryRow? { selectedRows.count == 1 ? selectedRows[0] : nil }
-    private var selectedFolder: RemoteEntry? { RemoteDirectorySelection.uniqueFolder(selectedRows.map(\.entry)) }
+    private var selectedRow: DirectoryRow? { selectionIsCurrent ? projection.selectedRow : nil }
+    private var selectedFolder: RemoteEntry? { RemoteDirectorySelection.uniqueFolder(selectedRows) }
 
     private func syncOpenAvailability() {
-        let entries = selectedRows.map(\.entry)
+        let entries = selectedRows
         bus.canShowDirectoryInfo = selectedRow != nil
         bus.setOpenAvailability(selectedFolder != nil && !model.isBusy)
         bus.canDownloadSelection = model.canDownloadSelection(entries)
@@ -216,7 +207,7 @@ struct DirectoryView: View {
             panel.canCreateDirectories = true
             panel.begin { response in
                 guard response == .OK, let url = panel.url,
-                      ticket.isCurrent(revision: uiRevision, entries: selectedRows.map(\.entry)),
+                      ticket.isCurrent(revision: uiRevision, entries: selectedRows),
                       model.isCurrentDownloadSelection(context) else { return }
                 do {
                     let identity = try LocalDownload.identity(url)
@@ -230,7 +221,7 @@ struct DirectoryView: View {
             panel.allowsMultipleSelection = false; panel.canCreateDirectories = false
             panel.begin { response in
                 guard response == .OK, let url = panel.url,
-                      ticket.isCurrent(revision: uiRevision, entries: selectedRows.map(\.entry)),
+                      ticket.isCurrent(revision: uiRevision, entries: selectedRows),
                       model.isCurrentDownloadSelection(context) else { return }
                 model.downloadSelection(context, to: url)
             }
@@ -246,8 +237,17 @@ struct DirectoryView: View {
         }
     }
 
+    private var selectionBinding: Binding<Set<Data>> {
+        Binding(get: { selectedEntries }, set: { ids in
+            // Cache and selection move together; no event-delay window authorizes an old row.
+            projection.select(ids)
+            selectedEntries = projection.selectedIDs
+            uiRevision &+= 1; nameEntry = nil; syncOpenAvailability()
+        })
+    }
+
     private var table: some View {
-        Table(rows, selection: $selectedEntries, sortOrder: $sortOrder) {
+        Table(rows, selection: selectionBinding, sortOrder: $sortOrder) {
             TableColumn("名称", value: \.name) { row in
                 DirectoryEntryCell(entry: row.entry,
                                    isSelected: selectedRow?.id == row.id,
@@ -284,7 +284,7 @@ struct DirectoryView: View {
 
     private func open(_ ids: Set<Data>) {
         guard !model.isBusy, ids == selectedEntries, ids.count == 1, let id = ids.first,
-              let row = rows.first(where: { $0.id == id }), row.entry.isDirectory else { return }
+              selectionIsCurrent, let row = projection.row(id: id), row.entry.isDirectory else { return }
         model.enter(row.entry)
     }
 

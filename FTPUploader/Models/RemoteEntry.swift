@@ -49,4 +49,24 @@ struct RemoteEntry: Identifiable, Equatable {
 struct DirectoryListing {
     let entries: [RemoteEntry]
     let encoding: FTPTextEncoding
+
+    /// Validate the complete fresh response, retaining only declared lookup names.
+    /// This is an index, not a cache or an overwrite authorization.
+    func indexed(names: Set<Data>, cancellation: FTPCancellationToken) throws -> [Data: RemoteEntry] {
+        var bytes = 0, seen = Set<Data>(), result: [Data: RemoteEntry] = [:]
+        for entry in entries {
+            try cancellation.checkCancellation()
+            guard entry.rawName.count <= TransferPlan.maximumListingBytes - bytes else {
+                throw FTPError.localFile("目录列表超过限制。")
+            }
+            bytes += entry.rawName.count
+            try RemotePath.validateName(entry.rawName)
+            guard seen.insert(entry.rawName).inserted, entry.kind != .unknown,
+                  try encoding.decode(entry.rawName) == entry.name else {
+                throw FTPError.localFile("目录含重名、未知类型或编码不一致。")
+            }
+            if names.contains(entry.rawName) { result[entry.rawName] = entry }
+        }
+        return result
+    }
 }

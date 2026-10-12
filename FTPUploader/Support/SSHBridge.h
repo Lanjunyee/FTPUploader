@@ -2,7 +2,7 @@
 #define FTP_SSH_BRIDGE_H
 #include "CurlBridge.h"
 typedef int (*SSHHostCallback)(const unsigned char *key, size_t length, int type, void *context);
-typedef struct { int code; unsigned long status; char message[768]; } SSHResult;
+typedef struct { int code; unsigned long status; int directory_attempted; char message[768]; } SSHResult;
 SSHResult ssh_probe(const char *host, int port, FTPOptions options, SSHHostCallback hostkey, FTPCancelCallback cancel, void *context);
 const char *ssh_result_message(const SSHResult *result);
 /* Values match RemoteEntry.Kind; absent or unrecognized type is unknown. */
@@ -21,5 +21,14 @@ SSHResult ssh_download(const char *host, int port, const char *path, const char 
 SSHResult ssh_mkdir(const char *host, int port, const char *path, const char *username, const char *password,
                     const unsigned char *private_key, size_t private_key_len, const char *passphrase, FTPOptions options,
                     SSHHostCallback hostkey, FTPCancelCallback cancel, void *context);
+/* Owner-local, serial-only cache. NULL preserves the per-operation API.
+ * The caller binds endpoint/authentication/trust and must destroy after backend return. */
+typedef struct SSHTransportSession SSHTransportSession;
+SSHTransportSession *ssh_session_create(void);
+void ssh_session_destroy(SSHTransportSession *session);
+SSHResult ssh_session_list(SSHTransportSession *, const char *, int, const char *, const char *, const char *, const unsigned char *, size_t, const char *, FTPOptions, SSHHostCallback, SSHEntryCallback, FTPCancelCallback, void *);
+SSHResult ssh_session_mkdir(SSHTransportSession *, const char *, int, const char *, const char *, const char *, const unsigned char *, size_t, const char *, FTPOptions, SSHHostCallback, FTPCancelCallback, void *);
+SSHResult ssh_session_upload_fd(SSHTransportSession *, const char *, int, const char *, int, const char *, const char *, const unsigned char *, size_t, const char *, FTPOptions, SSHHostCallback, FTPProgressCallback, FTPCancelCallback, void *);
+SSHResult ssh_session_download(SSHTransportSession *, const char *, int, const char *, const char *, const char *, const unsigned char *, size_t, const char *, FTPOptions, SSHHostCallback, FTPDataCallback, FTPProgressCallback, FTPCancelCallback, void *);
 int ssh_available(void);
 #endif
